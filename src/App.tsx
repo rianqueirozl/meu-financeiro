@@ -170,17 +170,30 @@ const STORAGE_KEY = 'financial-math:data:v1';
 
 async function loadData() {
   try {
+    // Ambiente Claude (artifact): usa window.storage
     if (typeof window !== 'undefined' && window.storage) {
       const r = await window.storage.get(STORAGE_KEY);
       if (r && r.value) return JSON.parse(r.value);
     }
+    // Ambiente real (Vercel / PWA): usa localStorage
+    if (typeof localStorage !== 'undefined') {
+      const v = localStorage.getItem(STORAGE_KEY);
+      if (v) return JSON.parse(v);
+    }
   } catch (e) {}
   return null;
 }
+
 async function saveData(data) {
   try {
+    const serialized = JSON.stringify(data);
+    // Ambiente Claude (artifact): usa window.storage
     if (typeof window !== 'undefined' && window.storage) {
-      await window.storage.set(STORAGE_KEY, JSON.stringify(data));
+      await window.storage.set(STORAGE_KEY, serialized);
+    }
+    // Ambiente real (Vercel / PWA): usa localStorage SEMPRE
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(STORAGE_KEY, serialized);
     }
   } catch (e) {}
 }
