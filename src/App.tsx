@@ -1,33 +1,3 @@
-// @ts-nocheck
-// Storage shim para funcionar fora do Claude
-if (!window.storage) {
-  window.storage = {
-    get: async (key) => {
-      try {
-        const value = localStorage.getItem(key);
-        return value ? { key, value } : null;
-      } catch { return null; }
-    },
-    set: async (key, value) => {
-      try {
-        localStorage.setItem(key, value);
-        return { key, value };
-      } catch { return null; }
-    },
-    delete: async (key) => {
-      try {
-        localStorage.removeItem(key);
-        return { key, deleted: true };
-      } catch { return null; }
-    },
-    list: async (prefix) => {
-      try {
-        const keys = Object.keys(localStorage).filter(k => !prefix || k.startsWith(prefix));
-        return { keys };
-      } catch { return { keys: [] }; }
-    }
-  };
-}
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   Home, List, Target, AlertTriangle, Settings, Plus,
@@ -107,40 +77,42 @@ const isMonthInRange = (mk, start, end) => {
 // =====================================================
 // DEFAULT DATA
 // =====================================================
+// budgetType: 'fixed' = conta obrigatória (valor previsto + pago/pendente)
+//             'envelope' = limite de gasto (teto mensal que vai sendo consumido)
 const DEFAULT_CATEGORIES = [
   { id: 'cat-salary', name: 'Salário', type: 'income', icon: '💰', subcategories: [] },
   { id: 'cat-other-income', name: 'Outras receitas', type: 'income', icon: '✨', subcategories: [] },
-  { id: 'cat-mandatory', name: 'Pagamentos obrigatórios', type: 'expense', icon: '📌', subcategories: [
+  { id: 'cat-mandatory', name: 'Pagamentos obrigatórios', type: 'expense', budgetType: 'fixed', icon: '📌', subcategories: [
     { id: 'sub-rent', name: 'Aluguel' },
     { id: 'sub-uni', name: 'Universidade' },
     { id: 'sub-loans', name: 'Empréstimos' },
   ]},
-  { id: 'cat-home', name: 'Casa', type: 'expense', icon: '🏠', subcategories: [
+  { id: 'cat-home', name: 'Casa', type: 'expense', budgetType: 'envelope', icon: '🏠', subcategories: [
     { id: 'sub-construction', name: 'Construção' },
     { id: 'sub-decor', name: 'Decoração' },
     { id: 'sub-utensils', name: 'Utensílios' },
     { id: 'sub-appliances', name: 'Eletrodomésticos' },
     { id: 'sub-furniture', name: 'Móveis' },
   ]},
-  { id: 'cat-food', name: 'Alimentação', type: 'expense', icon: '🍽️', subcategories: [] },
-  { id: 'cat-transport', name: 'Transporte', type: 'expense', icon: '🚗', subcategories: [
+  { id: 'cat-food', name: 'Alimentação', type: 'expense', budgetType: 'envelope', icon: '🍽️', subcategories: [] },
+  { id: 'cat-transport', name: 'Transporte', type: 'expense', budgetType: 'envelope', icon: '🚗', subcategories: [
     { id: 'sub-uber', name: 'Uber' },
     { id: 'sub-fuel', name: 'Combustível' },
   ]},
-  { id: 'cat-shopping', name: 'Compras pessoais', type: 'expense', icon: '🛍️', subcategories: [
+  { id: 'cat-shopping', name: 'Compras pessoais', type: 'expense', budgetType: 'envelope', icon: '🛍️', subcategories: [
     { id: 'sub-clothes', name: 'Roupas' },
     { id: 'sub-shoes', name: 'Calçados' },
     { id: 'sub-acc', name: 'Acessórios' },
     { id: 'sub-care', name: 'Cuidados pessoais' },
   ]},
-  { id: 'cat-leisure', name: 'Lazer', type: 'expense', icon: '🎬', subcategories: [] },
-  { id: 'cat-subs', name: 'Assinaturas', type: 'expense', icon: '📺', subcategories: [] },
-  { id: 'cat-health', name: 'Saúde', type: 'expense', icon: '⚕️', subcategories: [] },
-  { id: 'cat-growth', name: 'Crescimento', type: 'expense', icon: '📚', subcategories: [
+  { id: 'cat-leisure', name: 'Lazer', type: 'expense', budgetType: 'envelope', icon: '🎬', subcategories: [] },
+  { id: 'cat-subs', name: 'Assinaturas', type: 'expense', budgetType: 'fixed', icon: '📺', subcategories: [] },
+  { id: 'cat-health', name: 'Saúde', type: 'expense', budgetType: 'envelope', icon: '⚕️', subcategories: [] },
+  { id: 'cat-growth', name: 'Crescimento', type: 'expense', budgetType: 'envelope', icon: '📚', subcategories: [
     { id: 'sub-courses', name: 'Cursos' },
     { id: 'sub-books', name: 'Livros' },
   ]},
-  { id: 'cat-lifestyle', name: 'Estilo de vida', type: 'expense', icon: '✨', subcategories: [] },
+  { id: 'cat-lifestyle', name: 'Estilo de vida', type: 'expense', budgetType: 'envelope', icon: '✨', subcategories: [] },
 ];
 
 const EMPTY_DATA = () => ({
@@ -153,6 +125,8 @@ const EMPTY_DATA = () => ({
   goals: [],
   debts: [],
   monthClosings: {}, // { '2026-04': { surplus, allocation, target?, note } }
+  envelopeLinks: {}, // { 'cat-id': { type: 'goal'|'debt', targetId } }
+  envelopeLinkApplied: {}, // { 'cat-id_2026-05': true } — prevents duplicate auto-aportes
   settings: {
     currency: 'BRL',
     onboarded: false,
@@ -191,7 +165,7 @@ const EXAMPLE_DATA = () => {
 // =====================================================
 // PERSISTENCE
 // =====================================================
-const STORAGE_KEY = 'meu-financeiro:data:v1';
+const STORAGE_KEY = 'financial-math:data:v1';
 
 async function loadData() {
   try {
@@ -218,7 +192,9 @@ function computeMonthOccurrences(data, mk) {
   const out = [];
   for (const r of data.recurrences) {
     if (!isMonthInRange(mk, r.startMonth, r.endMonth)) continue;
-    const day = Math.min(Math.max(1, r.dayOfMonth || 1), 28);
+    const [year, month] = mk.split('-').map(Number);
+    const daysInMonth = new Date(year, month, 0).getDate(); // last day of that month
+    const day = Math.min(Math.max(1, r.dayOfMonth || 1), daysInMonth);
     const dateStr = `${mk}-${String(day).padStart(2,'0')}`;
     const stKey = `${r.id}_${mk}`;
     const st = data.recurrenceStatus[stKey] || {};
@@ -247,30 +223,62 @@ function getMonthEntries(data, mk) {
   return [...real, ...recs];
 }
 
+function getCatBudgetType(data, categoryId) {
+  const cat = data.categories.find(c => c.id === categoryId);
+  if (!cat) return 'fixed';
+  return cat.budgetType || 'fixed';
+}
+
 function computeMonthSummary(data, mk) {
   const entries = getMonthEntries(data, mk);
+  const budgets = data.budgets[mk] || {};
+
   let totalIncome = 0, receivedIncome = 0;
-  let totalExpense = 0, paidExpense = 0;
+  let totalFixed = 0, paidFixed = 0;
+  let spentInEnvelopes = 0;
+
   for (const e of entries) {
     if (e.type === 'income') {
       totalIncome += Number(e.amount) || 0;
       if (e.status === 'paid' || e.status === 'received') receivedIncome += Number(e.amount) || 0;
     } else if (e.type === 'expense') {
-      totalExpense += Number(e.amount) || 0;
-      if (e.status === 'paid') paidExpense += Number(e.amount) || 0;
+      const bType = getCatBudgetType(data, e.categoryId);
+      if (bType === 'fixed') {
+        totalFixed += Number(e.amount) || 0;
+        if (e.status === 'paid') paidFixed += Number(e.amount) || 0;
+      } else {
+        if (e.status === 'paid') spentInEnvelopes += Number(e.amount) || 0;
+      }
     }
   }
+
+  let totalEnvelopeBudgets = 0;
+  for (const [catId, amount] of Object.entries(budgets)) {
+    if (getCatBudgetType(data, catId) !== 'fixed') {
+      totalEnvelopeBudgets += Number(amount) || 0;
+    }
+  }
+
+  const pendingFixed = totalFixed - paidFixed;
+  const totalPlanned = totalFixed + totalEnvelopeBudgets;
+  const totalPaidOrSpent = paidFixed + spentInEnvelopes;
+  const freeSurplusProjected = totalIncome - totalPlanned;
+  const freeSurplusCurrent = receivedIncome - paidFixed - totalEnvelopeBudgets;
   const previousSurplus = computePreviousSurplus(data, mk);
+
   return {
-    totalIncome,
-    receivedIncome,
-    pendingIncome: totalIncome - receivedIncome,
-    totalExpense,
-    paidExpense,
-    pendingExpense: totalExpense - paidExpense,
-    expectedSurplus: totalIncome - totalExpense,
-    currentSurplus: receivedIncome - paidExpense,
-    previousSurplus,
+    totalIncome, receivedIncome, pendingIncome: totalIncome - receivedIncome,
+    totalFixed, paidFixed, pendingFixed,
+    totalEnvelopeBudgets, spentInEnvelopes,
+    envelopeReserved: Math.max(0, totalEnvelopeBudgets - spentInEnvelopes),
+    totalPlanned, totalPaidOrSpent, totalPending: pendingFixed,
+    freeSurplusProjected, freeSurplusCurrent, previousSurplus,
+    // Compatibilidade legada
+    totalExpense: totalFixed + spentInEnvelopes,
+    paidExpense: totalPaidOrSpent,
+    pendingExpense: pendingFixed,
+    expectedSurplus: freeSurplusProjected,
+    currentSurplus: freeSurplusCurrent,
   };
 }
 
@@ -291,12 +299,25 @@ function computeBudgetStatus(data, mk) {
   for (const [catId, budgetAmount] of Object.entries(budgets)) {
     const cat = data.categories.find(c => c.id === catId);
     if (!cat) continue;
-    const spent = entries.filter(e => e.categoryId === catId).reduce((s, e) => s + (Number(e.amount) || 0), 0);
+    if (getCatBudgetType(data, catId) === 'fixed') continue; // skip fixed in envelopes
+    const spent = entries.filter(e => e.categoryId === catId && e.status === 'paid').reduce((s, e) => s + (Number(e.amount) || 0), 0);
     const remaining = budgetAmount - spent;
     const pct = budgetAmount > 0 ? (spent / budgetAmount) * 100 : 0;
     result.push({ categoryId: catId, category: cat, budget: budgetAmount, spent, remaining, pct });
   }
   return result.sort((a, b) => b.pct - a.pct);
+}
+
+function computeFixedBillsStatus(data, mk) {
+  // Returns fixed bill entries (from categories with budgetType: 'fixed') for the month
+  const entries = getMonthEntries(data, mk).filter(e => e.type === 'expense');
+  const result = [];
+  for (const e of entries) {
+    if (getCatBudgetType(data, e.categoryId) === 'fixed') {
+      result.push(e);
+    }
+  }
+  return result.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
 }
 
 function getAlerts(data, mk) {
@@ -466,11 +487,14 @@ export default function App() {
             updateData={updateData}
             setData={setData}
             showToast={showToast}
+            openModal={setModal}
           />
         )}
       </main>
 
       <FAB onClick={() => setModal({ type: 'new-transaction-picker' })} />
+
+      <ScrollButtons />
 
       <BottomNav view={view} setView={setView} />
 
@@ -531,40 +555,112 @@ function GlobalStyles() {
 }
 
 // =====================================================
-// HEADER
+// HEADER + MONTH PICKER
 // =====================================================
-function Header({ currentMonth, setCurrentMonth, hideBalances, onToggleHide }) {
-  const goPrev = () => { const d = new Date(currentMonth); d.setMonth(d.getMonth() - 1); setCurrentMonth(d); };
-  const goNext = () => { const d = new Date(currentMonth); d.setMonth(d.getMonth() + 1); setCurrentMonth(d); };
-  const goNow = () => { const d = new Date(); d.setDate(1); setCurrentMonth(d); };
+const MONTH_NAMES = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'];
+const MONTH_SHORT = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
+
+function MonthPickerModal({ currentMonth, setCurrentMonth, onClose }) {
+  const [pickerYear, setPickerYear] = useState(currentMonth.getFullYear());
+  const currentMk = monthKey(currentMonth);
+
+  const select = (month) => {
+    const d = new Date(pickerYear, month, 1);
+    setCurrentMonth(d);
+    onClose();
+  };
 
   return (
-    <header style={{
-      position: 'sticky', top: 0, zIndex: 50,
-      background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)',
-      borderBottom: `0.5px solid ${C.separator}`,
-    }}>
-      <div style={{ maxWidth: 720, margin: '0 auto', padding: '14px 16px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <button onClick={goPrev} className="mf-button mf-press" style={iconBtn()}>
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 200,
+      background: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+      padding: 20, animation: 'overlay-in 0.2s ease',
+    }} onClick={onClose}>
+      <div style={{
+        background: C.card, borderRadius: 20, padding: 20, width: '100%', maxWidth: 340,
+        animation: 'modal-in 0.2s ease',
+      }} onClick={e => e.stopPropagation()}>
+        {/* Year selector */}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
+          <button onClick={() => setPickerYear(y => y - 1)} style={{ background: C.cardElevated, border: 'none', color: C.textPrimary, width: 36, height: 36, borderRadius: 10, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             <ChevronLeft size={20} />
           </button>
-          <button onClick={goNow} style={{
-            background: 'transparent', border: 'none', color: C.textPrimary, fontWeight: 700,
-            fontSize: 17, padding: '4px 12px', cursor: 'pointer', letterSpacing: '-0.01em',
-            minWidth: 150, textAlign: 'center',
-          }}>
-            {monthLabel(currentMonth)}
-          </button>
-          <button onClick={goNext} className="mf-button mf-press" style={iconBtn()}>
+          <div style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.02em' }}>{pickerYear}</div>
+          <button onClick={() => setPickerYear(y => y + 1)} style={{ background: C.cardElevated, border: 'none', color: C.textPrimary, width: 36, height: 36, borderRadius: 10, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             <ChevronRight size={20} />
           </button>
         </div>
-        <button onClick={onToggleHide} className="mf-button mf-press" style={iconBtn()} aria-label="Esconder valores">
-          {hideBalances ? <EyeOff size={18} /> : <Eye size={18} />}
+        {/* Month grid */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8 }}>
+          {MONTH_SHORT.map((m, i) => {
+            const mk = `${pickerYear}-${String(i + 1).padStart(2, '0')}`;
+            const isSelected = mk === currentMk;
+            const isToday = mk === monthKey(new Date());
+            return (
+              <button key={i} onClick={() => select(i)} style={{
+                padding: '10px 4px', borderRadius: 10, border: 'none', cursor: 'pointer',
+                background: isSelected ? C.blue : isToday ? C.cardElevated : 'transparent',
+                color: isSelected ? '#fff' : isToday ? C.blue : C.textPrimary,
+                fontSize: 14, fontWeight: isSelected || isToday ? 700 : 400,
+              }}>
+                {m}
+              </button>
+            );
+          })}
+        </div>
+        <button onClick={onClose} style={{
+          marginTop: 16, width: '100%', padding: '12px', background: C.cardElevated,
+          border: 'none', color: C.textSecondary, borderRadius: 12, fontSize: 15, cursor: 'pointer',
+        }}>
+          Cancelar
         </button>
       </div>
-    </header>
+    </div>
+  );
+}
+
+function Header({ currentMonth, setCurrentMonth, hideBalances, onToggleHide }) {
+  const [showPicker, setShowPicker] = useState(false);
+  const goPrev = () => { const d = new Date(currentMonth); d.setMonth(d.getMonth() - 1); setCurrentMonth(d); };
+  const goNext = () => { const d = new Date(currentMonth); d.setMonth(d.getMonth() + 1); setCurrentMonth(d); };
+
+  return (
+    <>
+      <header style={{
+        position: 'sticky', top: 0, zIndex: 50,
+        background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)',
+        borderBottom: `0.5px solid ${C.separator}`,
+      }}>
+        <div style={{ maxWidth: 720, margin: '0 auto', padding: '14px 16px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <button onClick={goPrev} className="mf-button mf-press" style={iconBtn()}>
+              <ChevronLeft size={20} />
+            </button>
+            <button onClick={() => setShowPicker(true)} className="mf-press" style={{
+              background: 'transparent', border: 'none', color: C.textPrimary, fontWeight: 700,
+              fontSize: 17, padding: '4px 12px', cursor: 'pointer', letterSpacing: '-0.01em',
+              minWidth: 150, textAlign: 'center', display: 'flex', alignItems: 'center', gap: 6,
+            }}>
+              {monthLabel(currentMonth)}
+              <ChevronDown size={14} color={C.textTertiary} />
+            </button>
+            <button onClick={goNext} className="mf-button mf-press" style={iconBtn()}>
+              <ChevronRight size={20} />
+            </button>
+          </div>
+          <button onClick={onToggleHide} className="mf-button mf-press" style={iconBtn()} aria-label="Esconder valores">
+            {hideBalances ? <EyeOff size={18} /> : <Eye size={18} />}
+          </button>
+        </div>
+      </header>
+      {showPicker && (
+        <MonthPickerModal
+          currentMonth={currentMonth}
+          setCurrentMonth={setCurrentMonth}
+          onClose={() => setShowPicker(false)}
+        />
+      )}
+    </>
   );
 }
 
@@ -637,6 +733,54 @@ function FAB({ onClick }) {
   );
 }
 
+function ScrollButtons() {
+  const [visible, setVisible] = useState(false);
+
+  useEffect(() => {
+    const onScroll = () => setVisible(window.scrollY > 200);
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => window.removeEventListener('scroll', onScroll);
+  }, []);
+
+  if (!visible) return null;
+
+  return (
+    <div style={{
+      position: 'fixed', left: 16, bottom: 100, zIndex: 44,
+      display: 'flex', flexDirection: 'column', gap: 8,
+    }}>
+      <button
+        onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
+        className="mf-press"
+        style={{
+          width: 36, height: 36, borderRadius: 18,
+          background: C.cardElevated, border: `0.5px solid ${C.separator}`,
+          color: C.textSecondary, cursor: 'pointer',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+        }}
+        aria-label="Ir ao topo"
+      >
+        <ChevronUp size={18} />
+      </button>
+      <button
+        onClick={() => window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' })}
+        className="mf-press"
+        style={{
+          width: 36, height: 36, borderRadius: 18,
+          background: C.cardElevated, border: `0.5px solid ${C.separator}`,
+          color: C.textSecondary, cursor: 'pointer',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          boxShadow: '0 4px 12px rgba(0,0,0,0.4)',
+        }}
+        aria-label="Ir ao final"
+      >
+        <ChevronDown size={18} />
+      </button>
+    </div>
+  );
+}
+
 // =====================================================
 // ONBOARDING
 // =====================================================
@@ -686,7 +830,7 @@ function Onboarding({ onChoose }) {
             <Wallet size={36} color="#fff" strokeWidth={2.2} />
           </div>
           <h1 style={{ fontSize: 32, fontWeight: 700, margin: 0, letterSpacing: '-0.03em' }}>
-            Meu Financeiro
+            Financial Math
           </h1>
           <p style={{ color: C.textSecondary, fontSize: 16, marginTop: 8, letterSpacing: '-0.01em' }}>
             Sua vida financeira, clara e simples.
@@ -785,24 +929,31 @@ function Dashboard({ data, mk, currentMonth, onSetView, onOpenModal, updateData,
 
   return (
     <div style={{ paddingTop: 16, display: 'flex', flexDirection: 'column', gap: 16 }}>
-      {/* HERO: Sobra prevista */}
-      <div className="mf-card" style={{
-        background: C.card, borderRadius: 18, padding: '20px 20px',
-      }}>
+      {/* HERO: Sobra livre prevista */}
+      <div className="mf-card" style={{ background: C.card, borderRadius: 18, padding: '20px 20px' }}>
         <div style={{ fontSize: 13, color: C.textSecondary, fontWeight: 500, letterSpacing: '-0.01em' }}>
-          Sobra prevista do mês
+          Sobra livre prevista
         </div>
         <div style={{
           fontSize: 38, fontWeight: 700, marginTop: 4, letterSpacing: '-0.03em',
-          color: summary.expectedSurplus >= 0 ? C.textPrimary : C.red,
+          color: summary.freeSurplusProjected >= 0 ? C.textPrimary : C.red,
         }}>
-          {hide ? '••••••' : formatBRL(summary.expectedSurplus)}
+          {hide ? '••••••' : formatBRL(summary.freeSurplusProjected)}
         </div>
-        <div style={{ display: 'flex', gap: 8, marginTop: 14 }}>
-          <MiniStat label="Recebido" value={hide ? '••' : formatBRLShort(summary.receivedIncome)} color={C.green} />
-          <MiniStat label="Pago" value={hide ? '••' : formatBRLShort(summary.paidExpense)} color={C.blue} />
-          <MiniStat label="Sobra atual" value={hide ? '••' : formatBRLShort(summary.currentSurplus)} color={summary.currentSurplus >= 0 ? C.textPrimary : C.red} />
+        <div style={{ fontSize: 12, color: C.textSecondary, marginTop: 2 }}>
+          entradas menos tudo que já tem destino
         </div>
+
+        {/* 6 métricas */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginTop: 14 }}>
+          <MetricTile label="Entradas" value={hide ? '••' : formatBRLShort(summary.totalIncome)} color={C.green} sub={summary.pendingIncome > 0 ? `${formatBRLShort(summary.pendingIncome)} pendente` : null} />
+          <MetricTile label="Destinado" value={hide ? '••' : formatBRLShort(summary.totalPlanned)} color={C.textSecondary} sub={`fixas + envelopes`} />
+          <MetricTile label="Pago/Gasto" value={hide ? '••' : formatBRLShort(summary.totalPaidOrSpent)} color={C.blue} sub={null} />
+          <MetricTile label="Pendente" value={hide ? '••' : formatBRLShort(summary.totalPending)} color={summary.totalPending > 0 ? C.orange : C.textTertiary} sub="contas fixas" />
+          <MetricTile label="Envelopes" value={hide ? '••' : formatBRLShort(summary.envelopeReserved)} color={C.textSecondary} sub="reservado" />
+          <MetricTile label="Livre agora" value={hide ? '••' : formatBRLShort(summary.freeSurplusCurrent)} color={summary.freeSurplusCurrent >= 0 ? C.green : C.red} sub="real atual" />
+        </div>
+
         {summary.previousSurplus > 0 && (
           <div style={{
             marginTop: 14, padding: '10px 12px', background: C.cardElevated, borderRadius: 10,
@@ -810,30 +961,30 @@ function Dashboard({ data, mk, currentMonth, onSetView, onOpenModal, updateData,
           }}>
             <PiggyBank size={16} color={C.green} />
             <div style={{ flex: 1, fontSize: 13 }}>
-              <span style={{ color: C.textSecondary }}>Sobra do mês anterior: </span>
+              <span style={{ color: C.textSecondary }}>Saldo livre do mês anterior: </span>
               <span style={{ color: C.green, fontWeight: 600 }}>{hide ? '••••' : formatBRL(summary.previousSurplus)}</span>
             </div>
           </div>
         )}
       </div>
 
-      {/* Cards de resumo */}
+      {/* Cards fixas vs envelopes */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
         <SummaryCard
-          icon={<ArrowDown size={16} />}
-          color={C.green}
-          label="Receitas"
-          mainValue={hide ? '••' : formatBRL(summary.receivedIncome)}
-          subValue={hide ? '' : `de ${formatBRL(summary.totalIncome)}`}
-          progress={summary.totalIncome > 0 ? (summary.receivedIncome / summary.totalIncome) : 0}
+          icon={<Receipt size={16} />}
+          color={C.orange}
+          label="Contas fixas"
+          mainValue={hide ? '••' : formatBRL(summary.paidFixed)}
+          subValue={hide ? '' : `de ${formatBRL(summary.totalFixed)}`}
+          progress={summary.totalFixed > 0 ? (summary.paidFixed / summary.totalFixed) : 0}
         />
         <SummaryCard
-          icon={<ArrowUp size={16} />}
+          icon={<Wallet size={16} />}
           color={C.blue}
-          label="Despesas"
-          mainValue={hide ? '••' : formatBRL(summary.paidExpense)}
-          subValue={hide ? '' : `de ${formatBRL(summary.totalExpense)}`}
-          progress={summary.totalExpense > 0 ? (summary.paidExpense / summary.totalExpense) : 0}
+          label="Envelopes"
+          mainValue={hide ? '••' : formatBRL(summary.spentInEnvelopes)}
+          subValue={hide ? '' : `de ${formatBRL(summary.totalEnvelopeBudgets)}`}
+          progress={summary.totalEnvelopeBudgets > 0 ? (summary.spentInEnvelopes / summary.totalEnvelopeBudgets) : 0}
         />
       </div>
 
@@ -983,6 +1134,16 @@ function MiniStat({ label, value, color }) {
     <div style={{ flex: 1, background: C.cardElevated, borderRadius: 10, padding: '10px 10px' }}>
       <div style={{ fontSize: 11, color: C.textSecondary, fontWeight: 500 }}>{label}</div>
       <div style={{ fontSize: 14, fontWeight: 600, color, marginTop: 2 }}>{value}</div>
+    </div>
+  );
+}
+
+function MetricTile({ label, value, color, sub }) {
+  return (
+    <div style={{ background: C.cardElevated, borderRadius: 10, padding: '10px 10px' }}>
+      <div style={{ fontSize: 10, color: C.textSecondary, fontWeight: 500, letterSpacing: '0.02em', textTransform: 'uppercase' }}>{label}</div>
+      <div style={{ fontSize: 13, fontWeight: 700, color, marginTop: 3, letterSpacing: '-0.01em' }}>{value}</div>
+      {sub && <div style={{ fontSize: 10, color: C.textTertiary, marginTop: 2 }}>{sub}</div>}
     </div>
   );
 }
@@ -1324,12 +1485,16 @@ function formatDateLabel(date) {
 // BUDGETS VIEW
 // =====================================================
 function BudgetsView({ data, mk, updateData, showToast }) {
-  const [editing, setEditing] = useState(null); // categoryId
+  const [editing, setEditing] = useState(null);
   const [tempValue, setTempValue] = useState('');
+  const [envelopeInput, setEnvelopeInput] = useState(null);
+  const [envelopeLinkFor, setEnvelopeLinkFor] = useState(null); // category object
   const status = useMemo(() => computeBudgetStatus(data, mk), [data, mk]);
+  const fixedBills = useMemo(() => computeFixedBillsStatus(data, mk), [data, mk]);
   const expenseCats = data.categories.filter(c => c.type === 'expense' || c.type === 'both');
+  const envelopeCats = expenseCats.filter(c => getCatBudgetType(data, c.id) !== 'fixed');
   const budgeted = new Set(status.map(s => s.categoryId));
-  const unbudgeted = expenseCats.filter(c => !budgeted.has(c.id));
+  const unbudgeted = envelopeCats.filter(c => !budgeted.has(c.id));
 
   const setBudget = (catId, value) => {
     const v = Number(String(value).replace(',', '.')) || 0;
@@ -1348,111 +1513,168 @@ function BudgetsView({ data, mk, updateData, showToast }) {
     showToast('Orçamento removido');
   };
 
-  const total = status.reduce((s, b) => s + b.budget, 0);
-  const totalSpent = status.reduce((s, b) => s + b.spent, 0);
+  const totalEnv = status.reduce((s, b) => s + b.budget, 0);
+  const totalEnvSpent = status.reduce((s, b) => s + b.spent, 0);
+  const totalFixed = fixedBills.reduce((s, e) => s + (Number(e.amount) || 0), 0);
+  const paidFixed = fixedBills.filter(e => e.status === 'paid').reduce((s, e) => s + (Number(e.amount) || 0), 0);
   const hide = data.settings.hideBalances;
 
   return (
     <div style={{ paddingTop: 16, display: 'flex', flexDirection: 'column', gap: 14 }}>
-      {/* summary */}
-      <div className="mf-card" style={{ background: C.card, borderRadius: 16, padding: '16px 16px' }}>
-        <div style={{ fontSize: 13, color: C.textSecondary, fontWeight: 500 }}>Total orçado</div>
-        <div style={{ fontSize: 28, fontWeight: 700, marginTop: 2, letterSpacing: '-0.02em' }}>
-          {hide ? '••••' : formatBRL(total)}
-        </div>
-        <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 12, fontSize: 13 }}>
-          <span style={{ color: C.textSecondary }}>Gasto: <strong style={{ color: C.textPrimary }}>{hide ? '••' : formatBRL(totalSpent)}</strong></span>
-          <span style={{ color: C.textSecondary }}>Restante: <strong style={{ color: total - totalSpent >= 0 ? C.green : C.red }}>{hide ? '••' : formatBRL(total - totalSpent)}</strong></span>
-        </div>
-      </div>
 
-      {/* lista de orçamentos */}
-      <Section title="Orçamentos ativos">
-        {status.length === 0 ? (
-          <div style={{ background: C.card, borderRadius: 14, padding: '24px 20px', textAlign: 'center', color: C.textSecondary, fontSize: 14 }}>
-            Defina abaixo os orçamentos do mês.
+      {/* ── CONTAS FIXAS ── */}
+      <Section title="Contas fixas">
+        {fixedBills.length === 0 ? (
+          <div style={{ background: C.card, borderRadius: 14, padding: '20px 16px', textAlign: 'center', color: C.textSecondary, fontSize: 14 }}>
+            Nenhuma conta fixa este mês.
           </div>
         ) : (
-          <div style={{ background: C.card, borderRadius: 14, overflow: 'hidden' }}>
-            {status.map((b, i) => (
-              <div key={b.categoryId} style={{
-                padding: '14px 14px',
-                borderTop: i === 0 ? 'none' : `0.5px solid ${C.separator}`,
-              }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-                    <span style={{ fontSize: 18 }}>{b.category.icon}</span>
-                    <span style={{ fontSize: 15, fontWeight: 500 }}>{b.category.name}</span>
-                  </div>
-                  <button
-                    onClick={() => removeBudget(b.categoryId)}
-                    style={{ background: 'none', border: 'none', color: C.textTertiary, cursor: 'pointer', padding: 4, display: 'flex' }}
-                  >
-                    <Trash2 size={15} />
-                  </button>
-                </div>
-                <div style={{
-                  height: 6, borderRadius: 3, background: C.cardElevated, overflow: 'hidden', marginBottom: 8,
-                }}>
-                  <div style={{
-                    height: '100%', width: `${Math.min(100, b.pct)}%`,
-                    background: b.pct >= 100 ? C.red : b.pct >= 85 ? C.orange : C.blue,
-                    transition: 'width 0.3s ease',
-                  }} />
-                </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 13 }}>
-                  <span style={{ color: C.textSecondary }}>
-                    {hide ? '••' : formatBRL(b.spent)} <span style={{ color: C.textTertiary }}>/ {hide ? '••' : formatBRL(b.budget)}</span>
-                  </span>
-                  {editing === b.categoryId ? (
-                    <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                      <input
-                        autoFocus
-                        type="text" inputMode="decimal"
-                        value={tempValue}
-                        onChange={(e) => setTempValue(e.target.value)}
-                        onKeyDown={(e) => { if (e.key === 'Enter') { setBudget(b.categoryId, tempValue); setEditing(null); }}}
-                        style={{
-                          width: 90, padding: '4px 8px', borderRadius: 6, border: `1px solid ${C.blue}`,
-                          background: C.bg, color: C.textPrimary, fontSize: 13, textAlign: 'right',
-                        }}
-                      />
-                      <button onClick={() => { setBudget(b.categoryId, tempValue); setEditing(null); }}
-                        style={{ background: C.blue, color: '#fff', border: 'none', padding: '4px 10px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>
-                        OK
-                      </button>
+          <>
+            <div style={{ background: C.card, borderRadius: 14, overflow: 'hidden' }}>
+              {fixedBills.map((e, i) => {
+                const cat = data.categories.find(c => c.id === e.categoryId);
+                const isPaid = e.status === 'paid';
+                return (
+                  <div key={e.id} style={{
+                    display: 'flex', alignItems: 'center', gap: 12, padding: '13px 14px',
+                    borderTop: i === 0 ? 'none' : `0.5px solid ${C.separator}`,
+                  }}>
+                    <div style={{
+                      width: 8, height: 8, borderRadius: 4, flexShrink: 0,
+                      background: isPaid ? C.green : C.orange,
+                    }} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 15, fontWeight: 500 }}>{e.name}</div>
+                      <div style={{ fontSize: 12, color: C.textSecondary, marginTop: 1 }}>
+                        {cat?.icon} {cat?.name}{e.date ? ` · dia ${new Date(e.date+'T00:00:00').getDate()}` : ''}
+                      </div>
                     </div>
-                  ) : (
-                    <button onClick={() => { setEditing(b.categoryId); setTempValue(String(b.budget)); }}
-                      style={{ background: 'none', border: 'none', color: C.blue, cursor: 'pointer', fontSize: 13, fontWeight: 500, padding: 0 }}>
-                      Editar
-                    </button>
-                  )}
-                </div>
-                <div style={{
-                  display: 'flex', justifyContent: 'space-between', marginTop: 4, fontSize: 12,
-                }}>
-                  <span style={{ color: b.remaining < 0 ? C.red : C.textSecondary, fontWeight: 500 }}>
-                    {b.remaining < 0 ? `Excedeu ${hide ? '••' : formatBRL(-b.remaining)}` : `Restam ${hide ? '••' : formatBRL(b.remaining)}`}
-                  </span>
-                  <span style={{ color: C.textTertiary, fontVariantNumeric: 'tabular-nums' }}>{b.pct.toFixed(0)}% usado</span>
-                </div>
-              </div>
-            ))}
+                    <div style={{ textAlign: 'right' }}>
+                      <div style={{ fontSize: 15, fontWeight: 600 }}>{hide ? '••' : formatBRL(e.amount)}</div>
+                      <div style={{ fontSize: 12, color: isPaid ? C.green : C.orange, fontWeight: 500 }}>
+                        {isPaid ? 'Pago' : 'Pendente'}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 4px', fontSize: 13, color: C.textSecondary }}>
+              <span>Pago: <strong style={{ color: C.green }}>{hide ? '••' : formatBRL(paidFixed)}</strong></span>
+              <span>Pendente: <strong style={{ color: paidFixed < totalFixed ? C.orange : C.textTertiary }}>{hide ? '••' : formatBRL(totalFixed - paidFixed)}</strong></span>
+            </div>
+          </>
+        )}
+      </Section>
+
+      {/* ── ENVELOPES ── */}
+      <Section title="Envelopes de gasto">
+        {status.length === 0 ? (
+          <div style={{ background: C.card, borderRadius: 14, padding: '20px 16px', textAlign: 'center', color: C.textSecondary, fontSize: 14 }}>
+            Defina os envelopes do mês abaixo.
           </div>
+        ) : (
+          <>
+            <div style={{ background: C.card, borderRadius: 14, overflow: 'hidden' }}>
+              {status.map((b, i) => (
+                <div key={b.categoryId} style={{
+                  padding: '14px 14px',
+                  borderTop: i === 0 ? 'none' : `0.5px solid ${C.separator}`,
+                }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 18 }}>{b.category.icon}</span>
+                      <div>
+                        <div style={{ fontSize: 15, fontWeight: 500 }}>{b.category.name}</div>
+                        <div style={{ fontSize: 12, color: C.textSecondary }}>
+                          {b.remaining >= 0
+                            ? `Restam ${hide ? '••' : formatBRL(b.remaining)}`
+                            : <span style={{ color: C.red }}>Excedeu {hide ? '••' : formatBRL(-b.remaining)}</span>
+                          }
+                        </div>
+                      </div>
+                    </div>
+                    <button onClick={() => removeBudget(b.categoryId)}
+                      style={{ background: 'none', border: 'none', color: C.textTertiary, cursor: 'pointer', padding: 4, display: 'flex' }}>
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                  <div style={{ height: 6, borderRadius: 3, background: C.cardElevated, overflow: 'hidden', marginBottom: 8 }}>
+                    <div style={{
+                      height: '100%', width: `${Math.min(100, b.pct)}%`,
+                      background: b.pct >= 100 ? C.red : b.pct >= 85 ? C.orange : C.blue,
+                      transition: 'width 0.3s ease',
+                    }} />
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 13 }}>
+                    <span style={{ color: C.textSecondary }}>
+                      {hide ? '••' : formatBRL(b.spent)} <span style={{ color: C.textTertiary }}>/ {hide ? '••' : formatBRL(b.budget)}</span>
+                    </span>
+                    {editing === b.categoryId ? (
+                      <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                        <input
+                          autoFocus type="text" inputMode="decimal"
+                          value={tempValue}
+                          onChange={(e) => setTempValue(e.target.value)}
+                          onKeyDown={(e) => { if (e.key === 'Enter') { setBudget(b.categoryId, tempValue); setEditing(null); }}}
+                          style={{ width: 90, padding: '4px 8px', borderRadius: 6, border: `1px solid ${C.blue}`, background: C.bg, color: C.textPrimary, fontSize: 13, textAlign: 'right' }}
+                        />
+                        <button onClick={() => { setBudget(b.categoryId, tempValue); setEditing(null); }}
+                          style={{ background: C.blue, color: '#fff', border: 'none', padding: '4px 10px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>OK</button>
+                      </div>
+                    ) : (
+                      <button onClick={() => { setEditing(b.categoryId); setTempValue(String(b.budget)); }}
+                        style={{ background: 'none', border: 'none', color: C.blue, cursor: 'pointer', fontSize: 13, fontWeight: 500, padding: 0 }}>
+                        Editar limite
+                      </button>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 12, color: C.textTertiary, marginTop: 4, textAlign: 'right' }}>
+                    {b.pct.toFixed(0)}% usado · reservado, não é sobra livre
+                  </div>
+                  {/* Vínculo com meta/dívida */}
+                  {(() => {
+                    const link = (data.envelopeLinks || {})[b.categoryId];
+                    const isApplied = !!(data.envelopeLinkApplied || {})[`${b.categoryId}_${mk}`];
+                    if (link && link.type !== 'none' && link.targetId) {
+                      const target = link.type === 'goal'
+                        ? data.goals.find(g => g.id === link.targetId)
+                        : data.debts.find(x => x.id === link.targetId);
+                      return (
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 8, padding: '8px 10px', background: isApplied ? C.greenDim : C.blueDim, borderRadius: 8 }}>
+                          <div style={{ fontSize: 12, color: isApplied ? C.green : C.blue }}>
+                            {isApplied ? '✓ Aplicado' : '⟶'} {link.type === 'goal' ? '🎯' : '💳'} {target?.name || '—'}
+                          </div>
+                          <button onClick={() => setEnvelopeLinkFor(b.category)} style={{ background: 'none', border: 'none', color: isApplied ? C.green : C.blue, fontSize: 12, cursor: 'pointer', padding: 0 }}>
+                            {isApplied ? 'Ver' : 'Aplicar'}
+                          </button>
+                        </div>
+                      );
+                    }
+                    return (
+                      <button onClick={() => setEnvelopeLinkFor(b.category)} style={{ marginTop: 8, background: 'none', border: 'none', color: C.textTertiary, fontSize: 12, cursor: 'pointer', padding: 0, textAlign: 'left' }}>
+                        + Vincular a meta ou dívida
+                      </button>
+                    );
+                  })()}
+                </div>
+              ))}
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 4px', fontSize: 13, color: C.textSecondary }}>
+              <span>Gasto: <strong style={{ color: C.textPrimary }}>{hide ? '••' : formatBRL(totalEnvSpent)}</strong></span>
+              <span>Total reservado: <strong style={{ color: C.blue }}>{hide ? '••' : formatBRL(totalEnv)}</strong></span>
+            </div>
+          </>
         )}
       </Section>
 
       {unbudgeted.length > 0 && (
-        <Section title="Adicionar orçamento">
+        <Section title="Adicionar envelope">
           <div style={{ background: C.card, borderRadius: 14, overflow: 'hidden' }}>
             {unbudgeted.map((c, i) => (
               <button
                 key={c.id}
-                onClick={() => {
-                  const v = prompt(`Orçamento para ${c.name} em ${monthShort(parseMonthKey(mk))} (R$):`);
-                  if (v != null && v !== '') setBudget(c.id, v);
-                }}
+                onClick={() => setEnvelopeInput(c)}
                 className="mf-press"
                 style={{
                   display: 'flex', alignItems: 'center', gap: 12, padding: '14px 14px', width: '100%',
@@ -1467,6 +1689,26 @@ function BudgetsView({ data, mk, updateData, showToast }) {
             ))}
           </div>
         </Section>
+      )}
+
+      {envelopeInput && (
+        <EnvelopeInputModal
+          category={envelopeInput}
+          mk={mk}
+          onSave={(v) => setBudget(envelopeInput.id, v)}
+          onClose={() => setEnvelopeInput(null)}
+        />
+      )}
+
+      {envelopeLinkFor && (
+        <EnvelopeLinkModal
+          category={envelopeLinkFor}
+          data={data}
+          mk={mk}
+          updateData={updateData}
+          showToast={showToast}
+          onClose={() => setEnvelopeLinkFor(null)}
+        />
       )}
     </div>
   );
@@ -1734,17 +1976,19 @@ function AllocationOption({ label, active, onClick }) {
 // =====================================================
 // SETTINGS VIEW
 // =====================================================
-function SettingsView({ data, updateData, setData, showToast }) {
+function SettingsView({ data, updateData, setData, showToast, openModal }) {
   const [showPlanning, setShowPlanning] = useState(false);
   const [showCategories, setShowCategories] = useState(false);
   const [showRecurrences, setShowRecurrences] = useState(false);
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [confirmExample, setConfirmExample] = useState(false);
   const fileInputRef = useRef(null);
 
   const exportData = () => {
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url; a.download = `meu-financeiro-backup-${todayKey()}.json`;
+    a.href = url; a.download = `financial-math-backup-${todayKey()}.json`;
     a.click();
     URL.revokeObjectURL(url);
     showToast('Backup exportado', 'success');
@@ -1766,18 +2010,15 @@ function SettingsView({ data, updateData, setData, showToast }) {
     reader.readAsText(file);
   };
 
-  const resetAll = () => {
-    if (confirm('Apagar TODOS os dados? Esta ação não pode ser desfeita.')) {
-      const e = EMPTY_DATA(); e.settings.onboarded = true;
-      setData(e);
-      showToast('Tudo apagado');
-    }
+  const doReset = () => {
+    const e = EMPTY_DATA(); e.settings.onboarded = true;
+    setData(e);
+    showToast('Todos os dados apagados');
   };
-  const loadExample = () => {
-    if (confirm('Carregar dados de exemplo? Seus dados atuais serão substituídos.')) {
-      setData(EXAMPLE_DATA());
-      showToast('Dados de exemplo carregados', 'success');
-    }
+
+  const doLoadExample = () => {
+    setData(EXAMPLE_DATA());
+    showToast('Dados de exemplo carregados', 'success');
   };
 
   if (showPlanning) {
@@ -1795,38 +2036,61 @@ function SettingsView({ data, updateData, setData, showToast }) {
   if (showRecurrences) {
     return <>
       <BackHeader title="Recorrências" onBack={() => setShowRecurrences(false)} />
-      <RecurrencesEditor data={data} updateData={updateData} showToast={showToast} />
+      <RecurrencesEditor data={data} updateData={updateData} showToast={showToast} openModal={openModal} />
     </>;
   }
 
   return (
-    <div style={{ paddingTop: 16, display: 'flex', flexDirection: 'column', gap: 14 }}>
-      <Section title="Gestão">
-        <div style={{ background: C.card, borderRadius: 14, overflow: 'hidden' }}>
-          <SettingRow Icon={Calendar} label="Planejamento mensal" onClick={() => setShowPlanning(true)} />
-          <SettingRow Icon={Tag} label="Categorias e subcategorias" onClick={() => setShowCategories(true)} />
-          <SettingRow Icon={Repeat} label="Recorrências" onClick={() => setShowRecurrences(true)} isLast />
-        </div>
-      </Section>
+    <>
+      <div style={{ paddingTop: 16, display: 'flex', flexDirection: 'column', gap: 14 }}>
+        <Section title="Gestão">
+          <div style={{ background: C.card, borderRadius: 14, overflow: 'hidden' }}>
+            <SettingRow Icon={Calendar} label="Planejamento mensal" onClick={() => setShowPlanning(true)} />
+            <SettingRow Icon={Tag} label="Categorias e subcategorias" onClick={() => setShowCategories(true)} />
+            <SettingRow Icon={Repeat} label="Recorrências" onClick={() => setShowRecurrences(true)} isLast />
+          </div>
+        </Section>
 
-      <Section title="Dados">
-        <div style={{ background: C.card, borderRadius: 14, overflow: 'hidden' }}>
-          <SettingRow Icon={FileDown} label="Exportar backup" onClick={exportData} />
-          <SettingRow Icon={FileUp} label="Importar backup" onClick={() => fileInputRef.current?.click()} />
-          <SettingRow Icon={Sparkles} label="Carregar dados de exemplo" onClick={loadExample} />
-          <SettingRow Icon={RotateCcw} label="Apagar todos os dados" onClick={resetAll} danger isLast />
-        </div>
-        <input
-          ref={fileInputRef} type="file" accept=".json,application/json"
-          style={{ display: 'none' }}
-          onChange={(e) => e.target.files?.[0] && importData(e.target.files[0])}
-        />
-      </Section>
+        <Section title="Dados">
+          <div style={{ background: C.card, borderRadius: 14, overflow: 'hidden' }}>
+            <SettingRow Icon={FileDown} label="Exportar backup" onClick={exportData} />
+            <SettingRow Icon={FileUp} label="Importar backup" onClick={() => fileInputRef.current?.click()} />
+            <SettingRow Icon={Sparkles} label="Carregar dados de exemplo" onClick={() => setConfirmExample(true)} />
+            <SettingRow Icon={RotateCcw} label="Apagar todos os dados" onClick={() => setConfirmReset(true)} danger isLast />
+          </div>
+          <input
+            ref={fileInputRef} type="file" accept=".json,application/json"
+            style={{ display: 'none' }}
+            onChange={(e) => e.target.files?.[0] && importData(e.target.files[0])}
+          />
+        </Section>
 
-      <div style={{ textAlign: 'center', color: C.textTertiary, fontSize: 12, padding: 20 }}>
-        Meu Financeiro · Dados salvos localmente neste dispositivo.
+        <div style={{ textAlign: 'center', color: C.textTertiary, fontSize: 12, padding: '8px 20px 24px', lineHeight: 1.8 }}>
+          Financial Math · Rian Queiroz
+        </div>
       </div>
-    </div>
+
+      {confirmReset && (
+        <ConfirmModal
+          title="Apagar todos os dados"
+          message="Essa ação apaga tudo permanentemente e não pode ser desfeita: lançamentos, recorrências, envelopes, metas, dívidas e configurações."
+          confirmLabel="Apagar tudo"
+          danger
+          onConfirm={doReset}
+          onClose={() => setConfirmReset(false)}
+        />
+      )}
+
+      {confirmExample && (
+        <ConfirmModal
+          title="Carregar dados de exemplo"
+          message="Seus dados atuais serão substituídos pelos dados de exemplo."
+          confirmLabel="Carregar exemplo"
+          onConfirm={doLoadExample}
+          onClose={() => setConfirmExample(false)}
+        />
+      )}
+    </>
   );
 }
 
@@ -1873,27 +2137,373 @@ function PlanningSubView({ data, updateData, showToast }) {
 }
 
 // =====================================================
+// ENVELOPE LINK MODAL
+// =====================================================
+function EnvelopeLinkModal({ category, data, mk, onClose, updateData, showToast }) {
+  const link = (data.envelopeLinks || {})[category.id];
+  const [type, setType] = useState(link?.type || 'none');
+  const [targetId, setTargetId] = useState(link?.targetId || '');
+
+  const goals = data.goals.filter(g => !g.parentId);
+  const debts = data.debts;
+
+  const save = () => {
+    updateData(d => ({
+      ...d,
+      envelopeLinks: {
+        ...(d.envelopeLinks || {}),
+        [category.id]: type === 'none' ? null : { type, targetId },
+      }
+    }));
+    showToast(type === 'none' ? 'Vínculo removido' : 'Vínculo salvo', 'success');
+    onClose();
+  };
+
+  const applyNow = () => {
+    const applyKey = `${category.id}_${mk}`;
+    if ((data.envelopeLinkApplied || {})[applyKey]) {
+      showToast('Já aplicado neste mês', 'error');
+      onClose();
+      return;
+    }
+    const amount = (data.budgets[mk] || {})[category.id] || 0;
+    if (amount <= 0) { showToast('Defina um valor para o envelope primeiro', 'error'); return; }
+
+    updateData(d => {
+      let newData = { ...d, envelopeLinkApplied: { ...(d.envelopeLinkApplied || {}), [applyKey]: true } };
+      if (type === 'goal' && targetId) {
+        newData = { ...newData, goals: newData.goals.map(g => g.id === targetId ? {
+          ...g, contributions: [...(g.contributions || []), { id: uid(), date: todayKey(), amount, note: `Envelope ${category.name} — ${monthShort(parseMonthKey(mk))}` }]
+        } : g) };
+      } else if (type === 'debt' && targetId) {
+        newData = { ...newData, debts: newData.debts.map(x => x.id === targetId ? {
+          ...x, payments: [...(x.payments || []), { id: uid(), date: todayKey(), amount, note: `Envelope ${category.name} — ${monthShort(parseMonthKey(mk))}` }]
+        } : x) };
+      }
+      return newData;
+    });
+    showToast(`${formatBRL(amount)} aplicado com sucesso`, 'success');
+    onClose();
+  };
+
+  const currentLink = (data.envelopeLinks || {})[category.id];
+  const isApplied = !!(data.envelopeLinkApplied || {})[`${category.id}_${mk}`];
+
+  return (
+    <ActionSheet title={`Vincular — ${category.name}`} onClose={onClose}>
+      <div style={{ marginBottom: 14 }}>
+        <div style={{ fontSize: 12, color: C.textTertiary, fontWeight: 600, marginBottom: 8 }}>VINCULAR A</div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {[
+            { id: 'none', label: 'Nenhum vínculo' },
+            { id: 'goal', label: '🎯 Meta' },
+            { id: 'debt', label: '💳 Dívida' },
+          ].map(opt => (
+            <button key={opt.id} onClick={() => { setType(opt.id); setTargetId(''); }} style={{
+              padding: '12px 16px', borderRadius: 10, border: 'none', cursor: 'pointer', textAlign: 'left',
+              background: type === opt.id ? C.blueDim : C.cardElevated,
+              color: type === opt.id ? C.blue : C.textPrimary,
+              fontSize: 15, fontWeight: type === opt.id ? 600 : 400,
+              display: 'flex', alignItems: 'center', gap: 10,
+            }}>
+              <div style={{ width: 18, height: 18, borderRadius: 9, border: `2px solid ${type === opt.id ? C.blue : C.textTertiary}`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                {type === opt.id && <div style={{ width: 8, height: 8, borderRadius: 4, background: C.blue }} />}
+              </div>
+              {opt.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {type === 'goal' && goals.length > 0 && (
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 12, color: C.textTertiary, fontWeight: 600, marginBottom: 8 }}>QUAL META</div>
+          <select value={targetId} onChange={e => setTargetId(e.target.value)} style={{ width: '100%', background: C.bg, color: C.textPrimary, border: `1px solid ${C.separator}`, borderRadius: 10, padding: '12px 14px', fontSize: 15 }}>
+            <option value="">Selecione uma meta</option>
+            {goals.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
+          </select>
+        </div>
+      )}
+
+      {type === 'debt' && debts.length > 0 && (
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 12, color: C.textTertiary, fontWeight: 600, marginBottom: 8 }}>QUAL DÍVIDA</div>
+          <select value={targetId} onChange={e => setTargetId(e.target.value)} style={{ width: '100%', background: C.bg, color: C.textPrimary, border: `1px solid ${C.separator}`, borderRadius: 10, padding: '12px 14px', fontSize: 15 }}>
+            <option value="">Selecione uma dívida</option>
+            {debts.map(x => <option key={x.id} value={x.id}>{x.name}</option>)}
+          </select>
+        </div>
+      )}
+
+      <button onClick={save} style={{ width: '100%', padding: '15px', background: C.blue, border: 'none', color: '#fff', borderRadius: 12, fontSize: 16, fontWeight: 700, cursor: 'pointer', marginBottom: 10 }}>
+        Salvar vínculo
+      </button>
+
+      {/* Apply now button — only shows when there's an active link and not yet applied this month */}
+      {currentLink && currentLink.type !== 'none' && currentLink.targetId && !isApplied && (
+        <button onClick={applyNow} style={{
+          width: '100%', padding: '13px', background: C.greenDim, border: 'none',
+          color: C.green, borderRadius: 12, fontSize: 15, fontWeight: 600, cursor: 'pointer', marginBottom: 10,
+        }}>
+          ✓ Aplicar ao {currentLink.type === 'goal' ? 'meta' : 'dívida'} agora ({monthShort(parseMonthKey(mk))})
+        </button>
+      )}
+      {currentLink && currentLink.type !== 'none' && currentLink.targetId && isApplied && (
+        <div style={{ textAlign: 'center', fontSize: 13, color: C.green, padding: '8px 0' }}>
+          ✓ Já aplicado em {monthShort(parseMonthKey(mk))}
+        </div>
+      )}
+
+      <button onClick={onClose} style={{ width: '100%', padding: '13px', background: 'transparent', border: 'none', color: C.textSecondary, fontSize: 15, cursor: 'pointer' }}>
+        Cancelar
+      </button>
+    </ActionSheet>
+  );
+}
+
+// =====================================================
+// ACTION SHEET (mobile-safe overlay from bottom)
+// =====================================================
+function ActionSheet({ title, onClose, children }) {
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 300,
+      background: 'rgba(0,0,0,0.6)',
+      display: 'flex', alignItems: 'flex-end', justifyContent: 'center',
+      animation: 'overlay-in 0.2s ease',
+    }} onClick={onClose}>
+      <div style={{
+        width: '100%', maxWidth: 540,
+        background: C.card, borderRadius: '20px 20px 0 0',
+        padding: '12px 20px 40px',
+        animation: 'modal-in 0.25s ease-out',
+      }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 12 }}>
+          <div style={{ width: 36, height: 4, background: C.separatorOpaque, borderRadius: 2 }} />
+        </div>
+        {title && (
+          <div style={{ fontSize: 13, fontWeight: 600, color: C.textTertiary, textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 16, textAlign: 'center' }}>
+            {title}
+          </div>
+        )}
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function ActionSheetButton({ label, icon, color, onClick, separator }) {
+  return (
+    <>
+      {separator && <div style={{ height: 0.5, background: C.separator, margin: '4px 0' }} />}
+      <button onClick={onClick} style={{
+        width: '100%', textAlign: 'left', padding: '15px 16px',
+        background: C.cardElevated, border: 'none',
+        color: color || C.textPrimary, fontSize: 16,
+        cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 12,
+        borderRadius: 12, marginBottom: 8,
+      }}>
+        {icon && <span style={{ fontSize: 20 }}>{icon}</span>}
+        {label}
+      </button>
+    </>
+  );
+}
+
+// =====================================================
+// ENVELOPE INPUT MODAL
+// =====================================================
+function EnvelopeInputModal({ category, mk, onSave, onClose }) {
+  const [value, setValue] = useState('');
+  const inputRef = useRef(null);
+
+  useEffect(() => { setTimeout(() => inputRef.current?.focus(), 100); }, []);
+
+  const submit = () => {
+    const v = Number(String(value).replace(',', '.'));
+    if (!v || v <= 0) return;
+    onSave(v);
+    onClose();
+  };
+
+  return (
+    <ActionSheet title={`Envelope — ${category.name}`} onClose={onClose}>
+      <div style={{ fontSize: 14, color: C.textSecondary, marginBottom: 12 }}>
+        Define o limite de gasto para {monthShort(parseMonthKey(mk))}
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: C.bg, borderRadius: 12, padding: '12px 16px', marginBottom: 16 }}>
+        <span style={{ fontSize: 18, color: C.textSecondary, fontWeight: 700 }}>R$</span>
+        <input
+          ref={inputRef}
+          type="number" inputMode="decimal" placeholder="0,00"
+          value={value} onChange={e => setValue(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && submit()}
+          style={{
+            flex: 1, background: 'transparent', border: 'none',
+            color: C.textPrimary, fontSize: 26, fontWeight: 700,
+            letterSpacing: '-0.02em',
+          }}
+        />
+      </div>
+      <button onClick={submit} style={{
+        width: '100%', padding: '16px', background: C.blue, border: 'none',
+        color: '#fff', borderRadius: 14, fontSize: 17, fontWeight: 700, cursor: 'pointer',
+      }}>
+        Salvar envelope
+      </button>
+      <button onClick={onClose} style={{
+        width: '100%', padding: '13px', background: 'transparent', border: 'none',
+        color: C.textSecondary, fontSize: 15, cursor: 'pointer', marginTop: 8,
+      }}>
+        Cancelar
+      </button>
+    </ActionSheet>
+  );
+}
+
+// =====================================================
+// SUBCATEGORY INPUT MODAL
+// =====================================================
+function SubcategoryInputModal({ catName, onSave, onClose }) {
+  const [value, setValue] = useState('');
+  const inputRef = useRef(null);
+  useEffect(() => { setTimeout(() => inputRef.current?.focus(), 100); }, []);
+
+  return (
+    <ActionSheet title={`Nova subcategoria — ${catName}`} onClose={onClose}>
+      <input
+        ref={inputRef} type="text" placeholder="Nome da subcategoria"
+        value={value} onChange={e => setValue(e.target.value)}
+        onKeyDown={e => e.key === 'Enter' && value.trim() && (onSave(value.trim()), onClose())}
+        style={{
+          width: '100%', background: C.bg, border: 'none', borderRadius: 12,
+          color: C.textPrimary, fontSize: 17, padding: '14px 16px', marginBottom: 16,
+          boxSizing: 'border-box',
+        }}
+      />
+      <button onClick={() => { if (value.trim()) { onSave(value.trim()); onClose(); } }} style={{
+        width: '100%', padding: '16px', background: C.blue, border: 'none',
+        color: '#fff', borderRadius: 14, fontSize: 17, fontWeight: 700, cursor: 'pointer',
+      }}>
+        Adicionar
+      </button>
+      <button onClick={onClose} style={{
+        width: '100%', padding: '13px', background: 'transparent', border: 'none',
+        color: C.textSecondary, fontSize: 15, cursor: 'pointer', marginTop: 8,
+      }}>
+        Cancelar
+      </button>
+    </ActionSheet>
+  );
+}
+
+// =====================================================
+// CONFIRM MODAL
+// =====================================================
+function ConfirmModal({ title, message, confirmLabel, onConfirm, onClose, danger }) {
+  return (
+    <ActionSheet title={title} onClose={onClose}>
+      {message && <div style={{ fontSize: 15, color: C.textSecondary, marginBottom: 20, textAlign: 'center', lineHeight: 1.5 }}>{message}</div>}
+      <button onClick={() => { onConfirm(); onClose(); }} style={{
+        width: '100%', padding: '16px', background: danger ? C.red : C.blue, border: 'none',
+        color: '#fff', borderRadius: 14, fontSize: 17, fontWeight: 700, cursor: 'pointer', marginBottom: 10,
+      }}>
+        {confirmLabel || 'Confirmar'}
+      </button>
+      <button onClick={onClose} style={{
+        width: '100%', padding: '13px', background: C.cardElevated, border: 'none',
+        color: C.textSecondary, fontSize: 15, cursor: 'pointer', borderRadius: 12,
+      }}>
+        Cancelar
+      </button>
+    </ActionSheet>
+  );
+}
+
+// =====================================================
+// NEW CATEGORY FORM (inline, no prompt)
+// =====================================================
+function NewCategoryForm({ onAdd }) {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState('');
+  const [type, setType] = useState('expense');
+  const [budgetType, setBudgetType] = useState('envelope');
+  const [icon, setIcon] = useState('📂');
+
+  const submit = () => {
+    if (!name.trim()) return;
+    onAdd(name.trim(), type, budgetType, icon);
+    setName(''); setIcon('📂'); setType('expense'); setBudgetType('envelope');
+    setOpen(false);
+  };
+
+  if (!open) {
+    return (
+      <button onClick={() => setOpen(true)} className="mf-press" style={addBtnStyle}>
+        <Plus size={18} /> Nova categoria
+      </button>
+    );
+  }
+
+  return (
+    <div style={{ background: C.card, borderRadius: 14, padding: 16, display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div style={{ fontSize: 13, fontWeight: 600, color: C.textSecondary, textTransform: 'uppercase', letterSpacing: '0.04em' }}>Nova categoria</div>
+      <div style={{ display: 'flex', gap: 8 }}>
+        <input
+          type="text" value={icon} onChange={e => setIcon(e.target.value.slice(0,2))}
+          maxLength={2}
+          style={{ width: 44, textAlign: 'center', background: C.cardElevated, border: 'none', borderRadius: 8, fontSize: 20, padding: '8px 4px', color: '#fff' }}
+        />
+        <input
+          autoFocus type="text" value={name} onChange={e => setName(e.target.value)}
+          placeholder="Nome da categoria"
+          onKeyDown={e => e.key === 'Enter' && submit()}
+          style={{ flex: 1, background: C.cardElevated, border: 'none', borderRadius: 8, padding: '8px 12px', color: C.textPrimary, fontSize: 15 }}
+        />
+      </div>
+      <div style={{ display: 'flex', gap: 8 }}>
+        <select value={type} onChange={e => setType(e.target.value)} style={{ flex: 1, background: C.cardElevated, color: C.textSecondary, border: 'none', borderRadius: 8, padding: '8px 10px', fontSize: 13 }}>
+          <option value="expense">Saída</option>
+          <option value="income">Entrada</option>
+          <option value="both">Ambos</option>
+        </select>
+        {(type === 'expense' || type === 'both') && (
+          <select value={budgetType} onChange={e => setBudgetType(e.target.value)} style={{ flex: 1, background: C.cardElevated, color: C.textSecondary, border: 'none', borderRadius: 8, padding: '8px 10px', fontSize: 13 }}>
+            <option value="envelope">Envelope</option>
+            <option value="fixed">Fixa</option>
+          </select>
+        )}
+      </div>
+      <div style={{ display: 'flex', gap: 8 }}>
+        <button onClick={() => setOpen(false)} style={{ flex: 1, padding: '10px', background: C.cardElevated, border: 'none', color: C.textSecondary, borderRadius: 10, fontSize: 14, cursor: 'pointer' }}>Cancelar</button>
+        <button onClick={submit} style={{ flex: 1, padding: '10px', background: C.blue, border: 'none', color: '#fff', borderRadius: 10, fontSize: 14, fontWeight: 600, cursor: 'pointer' }}>Criar</button>
+      </div>
+    </div>
+  );
+}
+
+// =====================================================
 // CATEGORIES EDITOR
 // =====================================================
 function CategoriesEditor({ data, updateData, showToast }) {
   const [expanded, setExpanded] = useState({});
-  const [editing, setEditing] = useState(null); // {kind: 'cat'|'sub', id, parentId?}
-  const [newCat, setNewCat] = useState(false);
-  const [newSubFor, setNewSubFor] = useState(null);
+  const [catSheet, setCatSheet] = useState(null); // category object
+  const [subInputFor, setSubInputFor] = useState(null); // category object
+  const [confirmDelete, setConfirmDelete] = useState(null); // category id
 
-  const addCategory = (name, type, icon) => {
+  const addCategory = (name, type, budgetType, icon) => {
     if (!name.trim()) return;
     const id = `cat-${uid()}`;
-    updateData(d => ({ ...d, categories: [...d.categories, { id, name: name.trim(), type, icon: icon || '📂', subcategories: [] }] }));
+    updateData(d => ({ ...d, categories: [...d.categories, { id, name: name.trim(), type, budgetType: budgetType || (type === 'expense' ? 'envelope' : undefined), icon: icon || '📂', subcategories: [] }] }));
     showToast('Categoria criada', 'success');
   };
   const updateCategory = (id, patch) => {
     updateData(d => ({ ...d, categories: d.categories.map(c => c.id === id ? { ...c, ...patch } : c) }));
   };
   const removeCategory = (id) => {
-    if (!confirm('Remover esta categoria? Lançamentos com ela ficarão sem categoria.')) return;
     updateData(d => ({ ...d, categories: d.categories.filter(c => c.id !== id) }));
     showToast('Categoria removida');
+    setCatSheet(null);
   };
   const addSub = (catId, name) => {
     if (!name.trim()) return;
@@ -1907,8 +2517,7 @@ function CategoriesEditor({ data, updateData, showToast }) {
     updateData(d => ({
       ...d,
       categories: d.categories.map(c => c.id === catId ? {
-        ...c,
-        subcategories: c.subcategories.map(s => s.id === subId ? { ...s, name } : s)
+        ...c, subcategories: c.subcategories.map(s => s.id === subId ? { ...s, name } : s)
       } : c)
     }));
   };
@@ -1916,164 +2525,228 @@ function CategoriesEditor({ data, updateData, showToast }) {
     updateData(d => ({
       ...d,
       categories: d.categories.map(c => c.id === catId ? {
-        ...c,
-        subcategories: c.subcategories.filter(s => s.id !== subId)
+        ...c, subcategories: c.subcategories.filter(s => s.id !== subId)
       } : c)
     }));
   };
 
   return (
-    <div style={{ paddingTop: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
-      {data.categories.map(c => (
-        <div key={c.id} style={{ background: C.card, borderRadius: 14, overflow: 'hidden' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '14px 14px' }}>
-            <input
-              type="text" value={c.icon || ''}
-              onChange={(e) => updateCategory(c.id, { icon: e.target.value.slice(0, 2) })}
-              maxLength={2}
-              style={{ width: 36, padding: '6px 0', textAlign: 'center', background: C.cardElevated, border: 'none', borderRadius: 7, fontSize: 18, color: '#fff' }}
-            />
-            <input
-              type="text" value={c.name}
-              onChange={(e) => updateCategory(c.id, { name: e.target.value })}
-              style={{ flex: 1, background: 'transparent', border: 'none', color: C.textPrimary, fontSize: 15, fontWeight: 500 }}
-            />
-            <select
-              value={c.type}
-              onChange={(e) => updateCategory(c.id, { type: e.target.value })}
-              style={{ background: C.cardElevated, color: C.textSecondary, border: 'none', borderRadius: 6, padding: '5px 8px', fontSize: 12 }}
-            >
-              <option value="expense">Saída</option>
-              <option value="income">Entrada</option>
-              <option value="both">Ambos</option>
-            </select>
-            <button onClick={() => setExpanded(s => ({ ...s, [c.id]: !s[c.id] }))} style={{ background: 'none', border: 'none', color: C.textTertiary, cursor: 'pointer', padding: 4, display: 'flex' }}>
-              {expanded[c.id] ? <ChevronUp size={18}/> : <ChevronDown size={18} />}
-            </button>
-            <button onClick={() => removeCategory(c.id)} style={{ background: 'none', border: 'none', color: C.textTertiary, cursor: 'pointer', padding: 4, display: 'flex' }}>
-              <Trash2 size={16} />
-            </button>
-          </div>
-          {expanded[c.id] && (
-            <div style={{ padding: '0 14px 14px', borderTop: `0.5px solid ${C.separator}` }}>
-              <div style={{ fontSize: 12, color: C.textSecondary, fontWeight: 600, padding: '10px 0 6px', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-                Subcategorias
+    <>
+      <div style={{ paddingTop: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
+        {data.categories.map(c => {
+          const isExpanded = expanded[c.id];
+          return (
+            <div key={c.id} style={{ background: C.card, borderRadius: 14 }}>
+              {/* ── Row principal ── */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 14px' }}>
+                <input
+                  type="text" value={c.icon || ''}
+                  onChange={(e) => updateCategory(c.id, { icon: e.target.value.slice(0, 2) })}
+                  maxLength={2}
+                  style={{ width: 38, height: 38, padding: 0, textAlign: 'center', background: C.cardElevated, border: 'none', borderRadius: 8, fontSize: 20, color: '#fff', flexShrink: 0 }}
+                />
+                <input
+                  type="text" value={c.name}
+                  onChange={(e) => updateCategory(c.id, { name: e.target.value })}
+                  style={{ flex: 1, minWidth: 0, background: 'transparent', border: 'none', color: C.textPrimary, fontSize: 15, fontWeight: 500 }}
+                />
+                <button
+                  onClick={() => setExpanded(s => ({ ...s, [c.id]: !s[c.id] }))}
+                  style={{ background: 'none', border: 'none', color: C.textTertiary, cursor: 'pointer', padding: 6, display: 'flex', flexShrink: 0 }}
+                >
+                  {isExpanded ? <ChevronUp size={18}/> : <ChevronDown size={18} />}
+                </button>
+                <button
+                  onClick={() => setCatSheet(c)}
+                  style={{ background: 'none', border: 'none', color: C.textTertiary, cursor: 'pointer', padding: 6, display: 'flex', flexShrink: 0 }}
+                >
+                  <MoreHorizontal size={18} />
+                </button>
               </div>
-              {(c.subcategories || []).map(s => (
-                <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0' }}>
-                  <input
-                    type="text" value={s.name}
-                    onChange={(e) => updateSub(c.id, s.id, e.target.value)}
-                    style={{ flex: 1, background: C.cardElevated, border: 'none', color: C.textPrimary, fontSize: 14, padding: '8px 10px', borderRadius: 8 }}
-                  />
-                  <button onClick={() => removeSub(c.id, s.id)} style={{ background: 'none', border: 'none', color: C.textTertiary, cursor: 'pointer', padding: 4, display: 'flex' }}>
-                    <Trash2 size={14} />
+
+              {/* Tags */}
+              <div style={{ padding: '0 14px 10px', display: 'flex', gap: 6 }}>
+                <span style={{ fontSize: 11, fontWeight: 600, padding: '3px 8px', borderRadius: 6, background: c.type === 'income' ? C.greenDim : C.blueDim, color: c.type === 'income' ? C.green : C.blue }}>
+                  {c.type === 'income' ? 'Entrada' : c.type === 'both' ? 'Entrada/Saída' : 'Saída'}
+                </span>
+                {(c.type === 'expense' || c.type === 'both') && (
+                  <span style={{ fontSize: 11, fontWeight: 600, padding: '3px 8px', borderRadius: 6, background: C.cardElevated, color: C.textSecondary }}>
+                    {c.budgetType === 'fixed' ? 'Fixa' : 'Envelope'}
+                  </span>
+                )}
+              </div>
+
+              {/* Subcategorias */}
+              {isExpanded && (
+                <div style={{ padding: '0 14px 14px', borderTop: `0.5px solid ${C.separator}` }}>
+                  <div style={{ fontSize: 12, color: C.textSecondary, fontWeight: 600, padding: '10px 0 6px', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                    Subcategorias
+                  </div>
+                  {(c.subcategories || []).map(s => (
+                    <div key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0' }}>
+                      <input
+                        type="text" value={s.name}
+                        onChange={(e) => updateSub(c.id, s.id, e.target.value)}
+                        style={{ flex: 1, background: C.cardElevated, border: 'none', color: C.textPrimary, fontSize: 14, padding: '8px 10px', borderRadius: 8 }}
+                      />
+                      <button onClick={() => removeSub(c.id, s.id)} style={{ background: 'none', border: 'none', color: C.textTertiary, cursor: 'pointer', padding: 6, display: 'flex' }}>
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  ))}
+                  <button
+                    onClick={() => setSubInputFor(c)}
+                    style={{ marginTop: 6, display: 'flex', alignItems: 'center', gap: 6, background: 'transparent', border: 'none', color: C.blue, cursor: 'pointer', fontSize: 13, fontWeight: 600, padding: '6px 0' }}
+                  >
+                    <Plus size={14} /> Nova subcategoria
                   </button>
                 </div>
+              )}
+            </div>
+          );
+        })}
+        <NewCategoryForm onAdd={addCategory} />
+      </div>
+
+      {/* ActionSheet do ⋯ */}
+      {catSheet && (
+        <ActionSheet title={catSheet.name} onClose={() => setCatSheet(null)}>
+          {/* Tipo */}
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ fontSize: 12, color: C.textTertiary, marginBottom: 6, fontWeight: 600 }}>TIPO</div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              {['expense', 'income', 'both'].map(t => (
+                <button key={t} onClick={() => updateCategory(catSheet.id, { type: t })} style={{
+                  flex: 1, padding: '10px 4px', borderRadius: 10, border: 'none', cursor: 'pointer', fontSize: 13, fontWeight: 600,
+                  background: catSheet.type === t ? C.blue : C.cardElevated,
+                  color: catSheet.type === t ? '#fff' : C.textSecondary,
+                }}>
+                  {t === 'expense' ? 'Saída' : t === 'income' ? 'Entrada' : 'Ambos'}
+                </button>
               ))}
-              <button
-                onClick={() => {
-                  const n = prompt('Nome da subcategoria:');
-                  if (n) addSub(c.id, n);
-                }}
-                style={{
-                  marginTop: 6, display: 'flex', alignItems: 'center', gap: 6,
-                  background: 'transparent', border: 'none', color: C.blue, cursor: 'pointer',
-                  fontSize: 13, fontWeight: 600, padding: '6px 0',
-                }}
-              >
-                <Plus size={14} /> Nova subcategoria
-              </button>
+            </div>
+          </div>
+          {/* Orçamento */}
+          {(catSheet.type === 'expense' || catSheet.type === 'both') && (
+            <div style={{ marginBottom: 16 }}>
+              <div style={{ fontSize: 12, color: C.textTertiary, marginBottom: 6, fontWeight: 600 }}>ORÇAMENTO</div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                {['envelope', 'fixed'].map(bt => (
+                  <button key={bt} onClick={() => updateCategory(catSheet.id, { budgetType: bt })} style={{
+                    flex: 1, padding: '10px 4px', borderRadius: 10, border: 'none', cursor: 'pointer', fontSize: 13, fontWeight: 600,
+                    background: (catSheet.budgetType || 'envelope') === bt ? C.blue : C.cardElevated,
+                    color: (catSheet.budgetType || 'envelope') === bt ? '#fff' : C.textSecondary,
+                  }}>
+                    {bt === 'envelope' ? 'Envelope' : 'Fixa'}
+                  </button>
+                ))}
+              </div>
             </div>
           )}
-        </div>
-      ))}
-      <button
-        onClick={() => {
-          const name = prompt('Nome da categoria:');
-          if (!name) return;
-          const type = prompt('Tipo (expense, income, both):', 'expense') || 'expense';
-          const icon = prompt('Emoji (opcional):', '📂');
-          addCategory(name, ['expense','income','both'].includes(type) ? type : 'expense', icon);
-        }}
-        className="mf-press"
-        style={addBtnStyle}
-      >
-        <Plus size={18} /> Nova categoria
-      </button>
-    </div>
+          <div style={{ height: 0.5, background: C.separator, margin: '4px 0 12px' }} />
+          <button onClick={() => { setConfirmDelete(catSheet.id); setCatSheet(null); }} style={{
+            width: '100%', padding: '15px', background: C.redDim, border: 'none',
+            color: C.red, borderRadius: 12, fontSize: 16, fontWeight: 600, cursor: 'pointer',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+          }}>
+            <Trash2 size={16} /> Excluir categoria
+          </button>
+          <button onClick={() => setCatSheet(null)} style={{
+            width: '100%', padding: '13px', background: 'transparent', border: 'none',
+            color: C.textSecondary, fontSize: 15, cursor: 'pointer', marginTop: 8,
+          }}>
+            Fechar
+          </button>
+        </ActionSheet>
+      )}
+
+      {/* Confirmar exclusão */}
+      {confirmDelete && (
+        <ConfirmModal
+          title="Excluir categoria"
+          message="Lançamentos com essa categoria ficarão sem categoria."
+          confirmLabel="Excluir"
+          danger
+          onConfirm={() => removeCategory(confirmDelete)}
+          onClose={() => setConfirmDelete(null)}
+        />
+      )}
+
+      {/* Nova subcategoria */}
+      {subInputFor && (
+        <SubcategoryInputModal
+          catName={subInputFor.name}
+          onSave={(name) => addSub(subInputFor.id, name)}
+          onClose={() => setSubInputFor(null)}
+        />
+      )}
+    </>
   );
 }
 
 // =====================================================
 // RECURRENCES EDITOR
 // =====================================================
-function RecurrencesEditor({ data, updateData, showToast }) {
+function RecurrencesEditor({ data, updateData, showToast, openModal }) {
+  const [confirmDelete, setConfirmDelete] = useState(null);
+
   return (
-    <div style={{ paddingTop: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
-      {data.recurrences.length === 0 ? (
-        <EmptyState
-          icon={<Repeat size={32} color={C.blue} />}
-          title="Nenhuma recorrência"
-          text="Crie recorrências em ‘Novo lançamento’ → ‘Recorrência’."
+    <>
+      <div style={{ paddingTop: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
+        {data.recurrences.length === 0 ? (
+          <EmptyState
+            icon={<Repeat size={32} color={C.blue} />}
+            title="Nenhuma recorrência"
+            text="Crie recorrências em 'Novo lançamento' → 'Recorrência'."
+          />
+        ) : data.recurrences.map(r => {
+          const cat = data.categories.find(c => c.id === r.categoryId);
+          return (
+            <div key={r.id} style={{ background: C.card, borderRadius: 14, padding: '14px 14px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                  <Repeat size={14} color={r.type === 'income' ? C.green : C.blue} />
+                  <div style={{ fontSize: 15, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.name}</div>
+                </div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: r.type === 'income' ? C.green : C.textPrimary, whiteSpace: 'nowrap' }}>
+                  {formatBRL(r.amount)}
+                </div>
+              </div>
+              <div style={{ fontSize: 12, color: C.textSecondary }}>
+                Dia {r.dayOfMonth} · {cat?.name || '—'} · {monthShort(parseMonthKey(r.startMonth))} {r.endMonth ? `→ ${monthShort(parseMonthKey(r.endMonth))}` : '→ sem fim'}
+              </div>
+              <div style={{ display: 'flex', gap: 10, marginTop: 10 }}>
+                <button
+                  onClick={() => openModal({ type: 'edit-recurrence', payload: r })}
+                  style={{ flex: 1, padding: '10px 0', borderRadius: 8, background: C.cardElevated, color: C.textPrimary, border: 'none', cursor: 'pointer', fontSize: 13, fontWeight: 600 }}
+                >
+                  Editar
+                </button>
+                <button
+                  onClick={() => setConfirmDelete(r.id)}
+                  style={{ flex: 1, padding: '10px 0', borderRadius: 8, background: C.redDim, color: C.red, border: 'none', cursor: 'pointer', fontSize: 13, fontWeight: 600 }}
+                >
+                  Excluir
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {confirmDelete && (
+        <ConfirmModal
+          title="Excluir recorrência"
+          message="Ocorrências passadas marcadas como pagas serão mantidas."
+          confirmLabel="Excluir"
+          danger
+          onConfirm={() => {
+            updateData(d => ({ ...d, recurrences: d.recurrences.filter(x => x.id !== confirmDelete) }));
+            showToast('Recorrência excluída');
+          }}
+          onClose={() => setConfirmDelete(null)}
         />
-      ) : data.recurrences.map(r => {
-        const cat = data.categories.find(c => c.id === r.categoryId);
-        return (
-          <div key={r.id} style={{ background: C.card, borderRadius: 14, padding: '14px 14px' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-                <Repeat size={14} color={r.type === 'income' ? C.green : C.blue} />
-                <div style={{ fontSize: 15, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{r.name}</div>
-              </div>
-              <div style={{ fontSize: 14, fontWeight: 700, color: r.type === 'income' ? C.green : C.textPrimary, whiteSpace: 'nowrap' }}>
-                {formatBRL(r.amount)}
-              </div>
-            </div>
-            <div style={{ fontSize: 12, color: C.textSecondary }}>
-              Dia {r.dayOfMonth} · {cat?.name || '—'} · {monthShort(parseMonthKey(r.startMonth))} {r.endMonth ? `→ ${monthShort(parseMonthKey(r.endMonth))}` : '→ sem fim'}
-            </div>
-            <div style={{ display: 'flex', gap: 10, marginTop: 10 }}>
-              <button
-                onClick={() => {
-                  const newAmount = prompt('Valor:', r.amount);
-                  if (newAmount == null) return;
-                  const newName = prompt('Nome:', r.name);
-                  if (newName == null) return;
-                  const newDay = prompt('Dia do mês (1-28):', r.dayOfMonth);
-                  if (newDay == null) return;
-                  const newEnd = prompt('Mês final (YYYY-MM, vazio = sem fim):', r.endMonth || '');
-                  updateData(d => ({
-                    ...d,
-                    recurrences: d.recurrences.map(x => x.id === r.id ? {
-                      ...x,
-                      amount: Number(String(newAmount).replace(',','.')) || 0,
-                      name: newName.trim() || x.name,
-                      dayOfMonth: Math.min(28, Math.max(1, Number(newDay) || x.dayOfMonth)),
-                      endMonth: newEnd || null,
-                    } : x)
-                  }));
-                  showToast('Recorrência atualizada', 'success');
-                }}
-                style={{ flex: 1, padding: '8px 0', borderRadius: 8, background: C.cardElevated, color: C.textPrimary, border: 'none', cursor: 'pointer', fontSize: 13, fontWeight: 600 }}
-              >
-                Editar
-              </button>
-              <button
-                onClick={() => {
-                  if (!confirm('Excluir esta recorrência? Ocorrências passadas marcadas como pagas serão mantidas.')) return;
-                  updateData(d => ({ ...d, recurrences: d.recurrences.filter(x => x.id !== r.id) }));
-                  showToast('Recorrência excluída');
-                }}
-                style={{ flex: 1, padding: '8px 0', borderRadius: 8, background: C.redDim, color: C.red, border: 'none', cursor: 'pointer', fontSize: 13, fontWeight: 600 }}
-              >
-                Excluir
-              </button>
-            </div>
-          </div>
-        );
-      })}
-    </div>
+      )}
+    </>
   );
 }
 
@@ -2260,13 +2933,18 @@ function TransactionForm({ transaction, data, mk, currentMonth, updateData, show
     close();
   };
 
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
   const remove = () => {
     if (isRecurrenceOccurrence) {
       showToast('Use a tela de Recorrências para excluir.', 'error');
       return;
     }
     if (!isEdit) return;
-    if (!confirm('Excluir este lançamento?')) return;
+    setConfirmDelete(true);
+  };
+
+  const doRemove = () => {
     updateData(d => ({ ...d, transactions: d.transactions.filter(t => t.id !== transaction.id) }));
     showToast('Lançamento excluído');
     close();
@@ -2397,6 +3075,17 @@ function TransactionForm({ transaction, data, mk, currentMonth, updateData, show
           </button>
         )}
       </div>
+
+      {confirmDelete && (
+        <ConfirmModal
+          title="Excluir lançamento"
+          message="O lançamento será removido permanentemente."
+          confirmLabel="Excluir"
+          danger
+          onConfirm={doRemove}
+          onClose={() => setConfirmDelete(false)}
+        />
+      )}
     </div>
   );
 }
@@ -2430,6 +3119,7 @@ function RecurrenceForm({ recurrence, data, mk, updateData, showToast, close }) 
   const [startMonth, setStartMonth] = useState(recurrence?.startMonth || mk);
   const [endMonth, setEndMonth] = useState(recurrence?.endMonth || '');
   const [hasEnd, setHasEnd] = useState(!!recurrence?.endMonth);
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   const cats = data.categories.filter(c => c.type === type || c.type === 'both');
   const cat = data.categories.find(c => c.id === categoryId);
@@ -2484,10 +3174,10 @@ function RecurrenceForm({ recurrence, data, mk, updateData, showToast, close }) 
             style={{ ...inputStyle(), fontSize: 22, fontWeight: 700 }}
           />
         </Field>
-        <Field label="Dia do mês (1-28)">
+        <Field label="Dia do mês (1-31)">
           <input
-            type="number" min={1} max={28} value={day}
-            onChange={(e) => setDay(Math.min(28, Math.max(1, Number(e.target.value) || 1)))}
+            type="number" min={1} max={31} value={day}
+            onChange={(e) => setDay(Math.min(31, Math.max(1, Number(e.target.value) || 1)))}
             style={inputStyle()}
           />
         </Field>
@@ -2519,12 +3209,7 @@ function RecurrenceForm({ recurrence, data, mk, updateData, showToast, close }) 
         </div>
 
         {isEdit && (
-          <button onClick={() => {
-            if (!confirm('Excluir esta recorrência? Ocorrências futuras deixarão de aparecer.')) return;
-            updateData(d => ({ ...d, recurrences: d.recurrences.filter(r => r.id !== recurrence.id) }));
-            showToast('Recorrência excluída');
-            close();
-          }} style={{
+          <button onClick={() => setConfirmDelete(true)} style={{
             marginTop: 8, padding: '12px 16px', background: C.redDim, color: C.red,
             border: 'none', borderRadius: 12, fontSize: 14, fontWeight: 600, cursor: 'pointer',
           }}>
@@ -2532,6 +3217,21 @@ function RecurrenceForm({ recurrence, data, mk, updateData, showToast, close }) 
           </button>
         )}
       </div>
+
+      {confirmDelete && (
+        <ConfirmModal
+          title="Excluir recorrência"
+          message="Ocorrências futuras deixarão de aparecer. Histórico de pagamentos mantido."
+          confirmLabel="Excluir"
+          danger
+          onConfirm={() => {
+            updateData(d => ({ ...d, recurrences: d.recurrences.filter(r => r.id !== recurrence.id) }));
+            showToast('Recorrência excluída');
+            close();
+          }}
+          onClose={() => setConfirmDelete(false)}
+        />
+      )}
     </div>
   );
 }
@@ -2546,10 +3246,16 @@ function GoalForm({ goal, data, updateData, showToast, close }) {
   const [parentId, setParentId] = useState(goal?.parentId || '');
   const [contribAmount, setContribAmount] = useState('');
   const [showAddContrib, setShowAddContrib] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   const parentOptions = data.goals.filter(g => !g.parentId && (!isEdit || g.id !== goal.id));
-  const saved = (goal?.contributions || []).reduce((s, c) => s + (Number(c.amount)||0), 0);
-  const pct = goal?.target > 0 ? Math.min(100, (saved / goal.target) * 100) : 0;
+
+  // Always read from live data to reflect contributions added in this session
+  const liveGoal = isEdit ? (data.goals.find(g => g.id === goal.id) || goal) : null;
+  const contributions = liveGoal?.contributions || [];
+  const saved = contributions.reduce((s, c) => s + (Number(c.amount)||0), 0);
+  const liveTarget = Number(String(target).replace(',', '.')) || liveGoal?.target || 0;
+  const pct = liveTarget > 0 ? Math.min(100, (saved / liveTarget) * 100) : 0;
 
   const save = () => {
     if (!name.trim()) { showToast('Informe um nome', 'error'); return; }
@@ -2558,7 +3264,7 @@ function GoalForm({ goal, data, updateData, showToast, close }) {
     const payload = {
       id: goal?.id || uid(),
       name: name.trim(), target: t, parentId: parentId || null,
-      contributions: goal?.contributions || [],
+      contributions: liveGoal?.contributions || [],
       deadline: goal?.deadline || null,
     };
     updateData(d => {
@@ -2585,101 +3291,119 @@ function GoalForm({ goal, data, updateData, showToast, close }) {
   };
 
   return (
-    <div style={{ padding: '8px 20px 0' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '4px 0 12px' }}>
-        <button onClick={close} style={{ background: 'none', border: 'none', color: C.blue, fontSize: 16, cursor: 'pointer', padding: 0 }}>Cancelar</button>
-        <div style={{ fontSize: 17, fontWeight: 600 }}>{isEdit ? 'Editar meta' : 'Nova meta'}</div>
-        <button onClick={save} style={{ background: 'none', border: 'none', color: C.blue, fontSize: 16, fontWeight: 600, cursor: 'pointer', padding: 0 }}>Salvar</button>
-      </div>
+    <>
+      <div style={{ padding: '8px 20px 0' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '4px 0 12px' }}>
+          <button onClick={close} style={{ background: 'none', border: 'none', color: C.blue, fontSize: 16, cursor: 'pointer', padding: 0 }}>Cancelar</button>
+          <div style={{ fontSize: 17, fontWeight: 600 }}>{isEdit ? 'Editar meta' : 'Nova meta'}</div>
+          <button onClick={save} style={{ background: 'none', border: 'none', color: C.blue, fontSize: 16, fontWeight: 600, cursor: 'pointer', padding: 0 }}>Salvar</button>
+        </div>
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-        <Field label="Nome">
-          <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="Ex: Reserva, Viagem..." style={inputStyle()} />
-        </Field>
-        <Field label="Valor alvo">
-          <input
-            type="text" inputMode="decimal" value={target}
-            onChange={(e) => setTarget(e.target.value.replace(/[^0-9.,]/g, ''))}
-            placeholder="0,00"
-            style={{ ...inputStyle(), fontSize: 22, fontWeight: 700 }}
-          />
-        </Field>
-        {parentOptions.length > 0 && (
-          <Field label="Submeta de (opcional)">
-            <select value={parentId} onChange={(e) => setParentId(e.target.value)} style={inputStyle()}>
-              <option value="">Nenhuma — meta independente</option>
-              {parentOptions.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-            </select>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <Field label="Nome">
+            <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="Ex: Reserva, Viagem..." style={inputStyle()} />
           </Field>
-        )}
+          <Field label="Valor alvo">
+            <input
+              type="text" inputMode="decimal" value={target}
+              onChange={(e) => setTarget(e.target.value.replace(/[^0-9.,]/g, ''))}
+              placeholder="0,00"
+              style={{ ...inputStyle(), fontSize: 22, fontWeight: 700 }}
+            />
+          </Field>
+          {parentOptions.length > 0 && (
+            <Field label="Submeta de (opcional)">
+              <select value={parentId} onChange={(e) => setParentId(e.target.value)} style={inputStyle()}>
+                <option value="">Nenhuma — meta independente</option>
+                {parentOptions.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+            </Field>
+          )}
 
-        {isEdit && (
-          <>
-            <div style={{ background: C.card, borderRadius: 12, padding: '14px 14px' }}>
-              <div style={{ fontSize: 13, color: C.textSecondary, fontWeight: 500 }}>Progresso</div>
-              <div style={{ fontSize: 24, fontWeight: 700, marginTop: 2 }}>{formatBRL(saved)} <span style={{ fontSize: 14, color: C.textTertiary, fontWeight: 500 }}>de {formatBRL(goal.target)}</span></div>
-              <div style={{ marginTop: 10, height: 6, borderRadius: 3, background: C.cardElevated, overflow: 'hidden' }}>
-                <div style={{ height: '100%', width: `${pct}%`, background: C.blue, transition: 'width 0.3s ease' }} />
+          {isEdit && (
+            <>
+              {/* Progresso — sempre lê do estado vivo */}
+              <div style={{ background: C.card, borderRadius: 12, padding: '14px 14px' }}>
+                <div style={{ fontSize: 13, color: C.textSecondary, fontWeight: 500 }}>Progresso</div>
+                <div style={{ fontSize: 24, fontWeight: 700, marginTop: 2 }}>
+                  {formatBRL(saved)} <span style={{ fontSize: 14, color: C.textTertiary, fontWeight: 500 }}>de {formatBRL(liveTarget)}</span>
+                </div>
+                <div style={{ marginTop: 10, height: 6, borderRadius: 3, background: C.cardElevated, overflow: 'hidden' }}>
+                  <div style={{ height: '100%', width: `${pct}%`, background: pct >= 100 ? C.green : C.blue, transition: 'width 0.3s ease' }} />
+                </div>
+                <div style={{ fontSize: 12, color: C.textSecondary, marginTop: 6 }}>
+                  {pct.toFixed(1)}% · Faltam {formatBRL(Math.max(0, liveTarget - saved))}
+                </div>
               </div>
-            </div>
 
-            <Field label="Aportes">
-              <div style={{ background: C.card, borderRadius: 12, padding: 4 }}>
-                {(goal.contributions || []).length === 0 ? (
-                  <div style={{ padding: 16, textAlign: 'center', color: C.textSecondary, fontSize: 13 }}>
-                    Sem aportes ainda
+              <Field label="Aportes">
+                <div style={{ background: C.card, borderRadius: 12, padding: 4 }}>
+                  {contributions.length === 0 ? (
+                    <div style={{ padding: 16, textAlign: 'center', color: C.textSecondary, fontSize: 13 }}>
+                      Sem aportes ainda
+                    </div>
+                  ) : (
+                    contributions.slice().reverse().map((c, i) => (
+                      <div key={c.id} style={{ display: 'flex', justifyContent: 'space-between', padding: '10px 12px', borderTop: i === 0 ? 'none' : `0.5px solid ${C.separator}` }}>
+                        <div style={{ fontSize: 13, color: C.textSecondary }}>{formatDateLabel(c.date)}</div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                          <div style={{ fontSize: 14, fontWeight: 600, color: C.green }}>+{formatBRL(c.amount)}</div>
+                          <button onClick={() => {
+                            updateData(d => ({
+                              ...d, goals: d.goals.map(g => g.id === goal.id ? { ...g, contributions: g.contributions.filter(x => x.id !== c.id) } : g)
+                            }));
+                          }} style={{ background: 'none', border: 'none', color: C.textTertiary, cursor: 'pointer', display: 'flex', padding: 2 }}>
+                            <X size={14} />
+                          </button>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+                {showAddContrib ? (
+                  <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+                    <input
+                      autoFocus type="text" inputMode="decimal" value={contribAmount}
+                      onChange={(e) => setContribAmount(e.target.value.replace(/[^0-9.,]/g, ''))}
+                      placeholder="Valor do aporte"
+                      onKeyDown={(e) => { if (e.key === 'Enter') addContribution(); }}
+                      style={{ ...inputStyle(), flex: 1 }}
+                    />
+                    <button onClick={addContribution} style={{ padding: '0 16px', background: C.blue, color: '#fff', border: 'none', borderRadius: 10, fontWeight: 600, fontSize: 14, cursor: 'pointer' }}>OK</button>
                   </div>
                 ) : (
-                  (goal.contributions || []).slice().reverse().map((c, i, arr) => (
-                    <div key={c.id} style={{ display: 'flex', justifyContent: 'space-between', padding: '10px 12px', borderTop: i === 0 ? 'none' : `0.5px solid ${C.separator}` }}>
-                      <div style={{ fontSize: 13, color: C.textSecondary }}>{formatDateLabel(c.date)}</div>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                        <div style={{ fontSize: 14, fontWeight: 600, color: C.green }}>+{formatBRL(c.amount)}</div>
-                        <button onClick={() => {
-                          updateData(d => ({
-                            ...d, goals: d.goals.map(g => g.id === goal.id ? { ...g, contributions: g.contributions.filter(x => x.id !== c.id) } : g)
-                          }));
-                        }} style={{ background: 'none', border: 'none', color: C.textTertiary, cursor: 'pointer', display: 'flex', padding: 2 }}>
-                          <X size={14} />
-                        </button>
-                      </div>
-                    </div>
-                  ))
+                  <button onClick={() => setShowAddContrib(true)} style={{ marginTop: 10, padding: '10px 14px', background: C.cardElevated, color: C.blue, border: 'none', borderRadius: 10, fontWeight: 600, fontSize: 14, cursor: 'pointer', width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
+                    <Plus size={16} /> Registrar aporte
+                  </button>
                 )}
-              </div>
-              {showAddContrib ? (
-                <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
-                  <input
-                    autoFocus type="text" inputMode="decimal" value={contribAmount}
-                    onChange={(e) => setContribAmount(e.target.value.replace(/[^0-9.,]/g, ''))}
-                    placeholder="Valor do aporte"
-                    onKeyDown={(e) => { if (e.key === 'Enter') addContribution(); }}
-                    style={{ ...inputStyle(), flex: 1 }}
-                  />
-                  <button onClick={addContribution} style={{ padding: '0 16px', background: C.blue, color: '#fff', border: 'none', borderRadius: 10, fontWeight: 600, fontSize: 14, cursor: 'pointer' }}>OK</button>
-                </div>
-              ) : (
-                <button onClick={() => setShowAddContrib(true)} style={{ marginTop: 10, padding: '10px 14px', background: C.cardElevated, color: C.blue, border: 'none', borderRadius: 10, fontWeight: 600, fontSize: 14, cursor: 'pointer', width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
-                  <Plus size={16} /> Registrar aporte
-                </button>
-              )}
-            </Field>
+              </Field>
 
-            <button onClick={() => {
-              if (!confirm('Excluir esta meta? Submetas vinculadas serão desvinculadas.')) return;
-              updateData(d => ({
-                ...d,
-                goals: d.goals.filter(g => g.id !== goal.id).map(g => g.parentId === goal.id ? { ...g, parentId: null } : g)
-              }));
-              showToast('Meta excluída'); close();
-            }} style={{
-              marginTop: 4, padding: '12px 16px', background: C.redDim, color: C.red,
-              border: 'none', borderRadius: 12, fontSize: 14, fontWeight: 600, cursor: 'pointer',
-            }}>Excluir meta</button>
-          </>
-        )}
+              <button onClick={() => setConfirmDelete(true)} style={{
+                marginTop: 4, padding: '12px 16px', background: C.redDim, color: C.red,
+                border: 'none', borderRadius: 12, fontSize: 14, fontWeight: 600, cursor: 'pointer',
+              }}>Excluir meta</button>
+            </>
+          )}
+        </div>
       </div>
-    </div>
+
+      {confirmDelete && (
+        <ConfirmModal
+          title="Excluir meta"
+          message="Submetas vinculadas serão desvinculadas."
+          confirmLabel="Excluir"
+          danger
+          onConfirm={() => {
+            updateData(d => ({
+              ...d,
+              goals: d.goals.filter(g => g.id !== goal.id).map(g => g.parentId === goal.id ? { ...g, parentId: null } : g)
+            }));
+            showToast('Meta excluída'); close();
+          }}
+          onClose={() => setConfirmDelete(false)}
+        />
+      )}
+    </>
   );
 }
 
@@ -2693,9 +3417,14 @@ function DebtForm({ debt, data, updateData, showToast, close }) {
   const [total, setTotal] = useState(debt?.total ? String(debt.total) : '');
   const [payAmount, setPayAmount] = useState('');
   const [showAddPay, setShowAddPay] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
-  const paid = (debt?.payments || []).reduce((s, p) => s + (Number(p.amount)||0), 0);
-  const pct = debt?.total > 0 ? Math.min(100, (paid / debt.total) * 100) : 0;
+  // Always read from live data to reflect payments added in this session
+  const liveDebt = isEdit ? (data.debts.find(x => x.id === debt.id) || debt) : null;
+  const payments = liveDebt?.payments || [];
+  const paid = payments.reduce((s, p) => s + (Number(p.amount)||0), 0);
+  const liveTotal = Number(String(total).replace(',', '.')) || liveDebt?.total || 0;
+  const pct = liveTotal > 0 ? Math.min(100, (paid / liveTotal) * 100) : 0;
 
   const save = () => {
     if (!name.trim()) { showToast('Informe um nome', 'error'); return; }
@@ -2703,7 +3432,7 @@ function DebtForm({ debt, data, updateData, showToast, close }) {
     if (t <= 0) { showToast('Informe o valor total', 'error'); return; }
     const payload = {
       id: debt?.id || uid(), name: name.trim(), creditor: creditor.trim(), total: t,
-      payments: debt?.payments || [],
+      payments: liveDebt?.payments || [],
     };
     updateData(d => {
       if (isEdit) return { ...d, debts: d.debts.map(x => x.id === payload.id ? payload : x) };
@@ -2728,82 +3457,99 @@ function DebtForm({ debt, data, updateData, showToast, close }) {
   };
 
   return (
-    <div style={{ padding: '8px 20px 0' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '4px 0 12px' }}>
-        <button onClick={close} style={{ background: 'none', border: 'none', color: C.blue, fontSize: 16, cursor: 'pointer', padding: 0 }}>Cancelar</button>
-        <div style={{ fontSize: 17, fontWeight: 600 }}>{isEdit ? 'Editar dívida' : 'Nova dívida'}</div>
-        <button onClick={save} style={{ background: 'none', border: 'none', color: C.blue, fontSize: 16, fontWeight: 600, cursor: 'pointer', padding: 0 }}>Salvar</button>
-      </div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-        <Field label="Nome">
-          <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="Ex: Cartão, Empréstimo..." style={inputStyle()} />
-        </Field>
-        <Field label="Credor">
-          <input type="text" value={creditor} onChange={(e) => setCreditor(e.target.value)} placeholder="Ex: Banco, pessoa..." style={inputStyle()} />
-        </Field>
-        <Field label="Valor total">
-          <input
-            type="text" inputMode="decimal" value={total}
-            onChange={(e) => setTotal(e.target.value.replace(/[^0-9.,]/g, ''))}
-            placeholder="0,00"
-            style={{ ...inputStyle(), fontSize: 22, fontWeight: 700 }}
-          />
-        </Field>
+    <>
+      <div style={{ padding: '8px 20px 0' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '4px 0 12px' }}>
+          <button onClick={close} style={{ background: 'none', border: 'none', color: C.blue, fontSize: 16, cursor: 'pointer', padding: 0 }}>Cancelar</button>
+          <div style={{ fontSize: 17, fontWeight: 600 }}>{isEdit ? 'Editar dívida' : 'Nova dívida'}</div>
+          <button onClick={save} style={{ background: 'none', border: 'none', color: C.blue, fontSize: 16, fontWeight: 600, cursor: 'pointer', padding: 0 }}>Salvar</button>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <Field label="Nome">
+            <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="Ex: Cartão, Empréstimo..." style={inputStyle()} />
+          </Field>
+          <Field label="Credor">
+            <input type="text" value={creditor} onChange={(e) => setCreditor(e.target.value)} placeholder="Ex: Banco, pessoa..." style={inputStyle()} />
+          </Field>
+          <Field label="Valor total">
+            <input
+              type="text" inputMode="decimal" value={total}
+              onChange={(e) => setTotal(e.target.value.replace(/[^0-9.,]/g, ''))}
+              placeholder="0,00"
+              style={{ ...inputStyle(), fontSize: 22, fontWeight: 700 }}
+            />
+          </Field>
 
-        {isEdit && (
-          <>
-            <div style={{ background: C.card, borderRadius: 12, padding: '14px 14px' }}>
-              <div style={{ fontSize: 13, color: C.textSecondary, fontWeight: 500 }}>Pago</div>
-              <div style={{ fontSize: 24, fontWeight: 700, marginTop: 2 }}>{formatBRL(paid)} <span style={{ fontSize: 14, color: C.textTertiary, fontWeight: 500 }}>de {formatBRL(debt.total)}</span></div>
-              <div style={{ marginTop: 10, height: 6, borderRadius: 3, background: C.cardElevated, overflow: 'hidden' }}>
-                <div style={{ height: '100%', width: `${pct}%`, background: C.orange, transition: 'width 0.3s ease' }} />
-              </div>
-              <div style={{ fontSize: 13, color: C.textSecondary, marginTop: 8 }}>Restam {formatBRL(Math.max(0, debt.total - paid))}</div>
-            </div>
-
-            <Field label="Pagamentos">
-              <div style={{ background: C.card, borderRadius: 12, padding: 4 }}>
-                {(debt.payments || []).length === 0 ? (
-                  <div style={{ padding: 16, textAlign: 'center', color: C.textSecondary, fontSize: 13 }}>Sem pagamentos ainda</div>
-                ) : (debt.payments || []).slice().reverse().map((p, i) => (
-                  <div key={p.id} style={{ display: 'flex', justifyContent: 'space-between', padding: '10px 12px', borderTop: i === 0 ? 'none' : `0.5px solid ${C.separator}` }}>
-                    <div style={{ fontSize: 13, color: C.textSecondary }}>{formatDateLabel(p.date)}</div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                      <div style={{ fontSize: 14, fontWeight: 600, color: C.green }}>{formatBRL(p.amount)}</div>
-                      <button onClick={() => {
-                        updateData(d => ({ ...d, debts: d.debts.map(x => x.id === debt.id ? { ...x, payments: x.payments.filter(y => y.id !== p.id) } : x) }));
-                      }} style={{ background: 'none', border: 'none', color: C.textTertiary, cursor: 'pointer', display: 'flex', padding: 2 }}><X size={14} /></button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-              {showAddPay ? (
-                <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
-                  <input autoFocus type="text" inputMode="decimal" value={payAmount}
-                    onChange={(e) => setPayAmount(e.target.value.replace(/[^0-9.,]/g, ''))}
-                    placeholder="Valor pago"
-                    onKeyDown={(e) => { if (e.key === 'Enter') addPayment(); }}
-                    style={{ ...inputStyle(), flex: 1 }} />
-                  <button onClick={addPayment} style={{ padding: '0 16px', background: C.blue, color: '#fff', border: 'none', borderRadius: 10, fontWeight: 600, fontSize: 14, cursor: 'pointer' }}>OK</button>
+          {isEdit && (
+            <>
+              {/* Progresso — sempre lê do estado vivo */}
+              <div style={{ background: C.card, borderRadius: 12, padding: '14px 14px' }}>
+                <div style={{ fontSize: 13, color: C.textSecondary, fontWeight: 500 }}>Pago</div>
+                <div style={{ fontSize: 24, fontWeight: 700, marginTop: 2 }}>
+                  {formatBRL(paid)} <span style={{ fontSize: 14, color: C.textTertiary, fontWeight: 500 }}>de {formatBRL(liveTotal)}</span>
                 </div>
-              ) : (
-                <button onClick={() => setShowAddPay(true)} style={{ marginTop: 10, padding: '10px 14px', background: C.cardElevated, color: C.blue, border: 'none', borderRadius: 10, fontWeight: 600, fontSize: 14, cursor: 'pointer', width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
-                  <Plus size={16} /> Registrar pagamento
-                </button>
-              )}
-            </Field>
+                <div style={{ marginTop: 10, height: 6, borderRadius: 3, background: C.cardElevated, overflow: 'hidden' }}>
+                  <div style={{ height: '100%', width: `${pct}%`, background: C.orange, transition: 'width 0.3s ease' }} />
+                </div>
+                <div style={{ fontSize: 12, color: C.textSecondary, marginTop: 6 }}>
+                  {pct.toFixed(1)}% pago · Restam {formatBRL(Math.max(0, liveTotal - paid))}
+                </div>
+              </div>
 
-            <button onClick={() => {
-              if (!confirm('Excluir esta dívida?')) return;
-              updateData(d => ({ ...d, debts: d.debts.filter(x => x.id !== debt.id) }));
-              showToast('Dívida excluída'); close();
-            }} style={{
-              marginTop: 4, padding: '12px 16px', background: C.redDim, color: C.red,
-              border: 'none', borderRadius: 12, fontSize: 14, fontWeight: 600, cursor: 'pointer',
-            }}>Excluir dívida</button>
-          </>
-        )}
+              <Field label="Pagamentos">
+                <div style={{ background: C.card, borderRadius: 12, padding: 4 }}>
+                  {payments.length === 0 ? (
+                    <div style={{ padding: 16, textAlign: 'center', color: C.textSecondary, fontSize: 13 }}>Sem pagamentos ainda</div>
+                  ) : payments.slice().reverse().map((p, i) => (
+                    <div key={p.id} style={{ display: 'flex', justifyContent: 'space-between', padding: '10px 12px', borderTop: i === 0 ? 'none' : `0.5px solid ${C.separator}` }}>
+                      <div style={{ fontSize: 13, color: C.textSecondary }}>{formatDateLabel(p.date)}</div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                        <div style={{ fontSize: 14, fontWeight: 600, color: C.green }}>{formatBRL(p.amount)}</div>
+                        <button onClick={() => {
+                          updateData(d => ({ ...d, debts: d.debts.map(x => x.id === debt.id ? { ...x, payments: x.payments.filter(y => y.id !== p.id) } : x) }));
+                        }} style={{ background: 'none', border: 'none', color: C.textTertiary, cursor: 'pointer', display: 'flex', padding: 2 }}><X size={14} /></button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                {showAddPay ? (
+                  <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+                    <input autoFocus type="text" inputMode="decimal" value={payAmount}
+                      onChange={(e) => setPayAmount(e.target.value.replace(/[^0-9.,]/g, ''))}
+                      placeholder="Valor pago"
+                      onKeyDown={(e) => { if (e.key === 'Enter') addPayment(); }}
+                      style={{ ...inputStyle(), flex: 1 }} />
+                    <button onClick={addPayment} style={{ padding: '0 16px', background: C.blue, color: '#fff', border: 'none', borderRadius: 10, fontWeight: 600, fontSize: 14, cursor: 'pointer' }}>OK</button>
+                  </div>
+                ) : (
+                  <button onClick={() => setShowAddPay(true)} style={{ marginTop: 10, padding: '10px 14px', background: C.cardElevated, color: C.blue, border: 'none', borderRadius: 10, fontWeight: 600, fontSize: 14, cursor: 'pointer', width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
+                    <Plus size={16} /> Registrar pagamento
+                  </button>
+                )}
+              </Field>
+
+              <button onClick={() => setConfirmDelete(true)} style={{
+                marginTop: 4, padding: '12px 16px', background: C.redDim, color: C.red,
+                border: 'none', borderRadius: 12, fontSize: 14, fontWeight: 600, cursor: 'pointer',
+              }}>Excluir dívida</button>
+            </>
+          )}
+        </div>
       </div>
-    </div>
+
+      {confirmDelete && (
+        <ConfirmModal
+          title="Excluir dívida"
+          message="O histórico de pagamentos será perdido."
+          confirmLabel="Excluir"
+          danger
+          onConfirm={() => {
+            updateData(d => ({ ...d, debts: d.debts.filter(x => x.id !== debt.id) }));
+            showToast('Dívida excluída'); close();
+          }}
+          onClose={() => setConfirmDelete(false)}
+        />
+      )}
+    </>
   );
 }
