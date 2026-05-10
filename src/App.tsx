@@ -133,6 +133,7 @@ const EMPTY_DATA = () => ({
     onboarded: false,
     hideBalances: false,
     initialBalance: 0,
+    tutorialSeen: false,
   },
 });
 
@@ -240,12 +241,15 @@ function getMonthEntries(data, mk) {
 function getCatBudgetType(data, categoryId) {
   const cat = data.categories.find(c => c.id === categoryId);
   if (!cat) return 'fixed';
+  // Categorias de entrada nunca são envelope nem fixa no sentido de despesa
+  if (cat.type === 'income') return 'income';
   return cat.budgetType || 'fixed';
 }
 
 function computeMonthSummary(data, mk) {
   const entries = getMonthEntries(data, mk);
   const budgets = data.budgets[mk] || {};
+  const envelopeLinkApplied = data.envelopeLinkApplied || {};
 
   let totalIncome = 0, receivedIncome = 0;
   let totalFixed = 0, paidFixed = 0;
@@ -266,13 +270,61 @@ function computeMonthSummary(data, mk) {
     }
   }
 
-  let totalEnvelopeBudgets = 0;
-  for (const [catId, amount] of Object.entries(budgets)) {
-    if (getCatBudgetType(data, catId) !== 'fixed') {
-      totalEnvelopeBudgets += Number(amount) || 0;
+  // ─── Envelopes: separar em três estados ───────────────────────────────
+  // applied: valor aplicado em meta/dívida (persiste mesmo sem budget entry)
+  // reserved: limite definido no mês mas não aplicado nem gasto
+  // spent:  lançamentos pagos na categoria (já em spentInEnvelopes acima)
+  //
+  // Estratégia: coletar todos os catIds relevantes para este mês:
+  //   (a) catIds que têm budget entry  (b) catIds que têm applied record para este mk
+
+  const envelopeCatIds = new Set();
+  const appliedAmounts = {}; // catId → amount (from stored record)
+
+  // (a) De budgets do mês
+  for (const catId of Object.keys(budgets)) {
+    const bType = getCatBudgetType(data, catId);
+    if (bType === 'income' || bType === 'fixed') continue;
+    envelopeCatIds.add(catId);
+  }
+
+  // (b) De applied records para este mk — garante que valor aplicado
+  //     continue contando mesmo se budget entry foi removido depois
+  for (const [applyKey, record] of Object.entries(envelopeLinkApplied)) {
+    if (!applyKey.endsWith(`_${mk}`)) continue;
+    const catId = applyKey.slice(0, -(mk.length + 1));
+    envelopeCatIds.add(catId);
+    // record pode ser true (formato antigo) ou objeto {amount,...}
+    if (record && typeof record === 'object' && record.amount) {
+      appliedAmounts[catId] = Number(record.amount) || 0;
     }
   }
 
+  let totalEnvelopeBudgets = 0;
+  let envelopeApplied = 0;
+
+  for (const catId of envelopeCatIds) {
+    const budgetAmount = Number(budgets[catId] || 0);
+    const applyKey = `${catId}_${mk}`;
+    const record = envelopeLinkApplied[applyKey];
+    const isApplied = !!record;
+
+    if (isApplied) {
+      // Usar o valor do record se disponível (objeto), senão budget entry
+      const appliedAmt = appliedAmounts[catId] ?? budgetAmount;
+      envelopeApplied += appliedAmt;
+      // Totalizar: o envelope continua "destinado" pelo valor aplicado
+      totalEnvelopeBudgets += appliedAmt;
+      // Se há budget entry além do aplicado (ex: envelope aumentado depois), conta a diferença
+      if (budgetAmount > appliedAmt) {
+        totalEnvelopeBudgets += budgetAmount - appliedAmt;
+      }
+    } else {
+      totalEnvelopeBudgets += budgetAmount;
+    }
+  }
+
+  const envelopePureReserved = Math.max(0, totalEnvelopeBudgets - envelopeApplied - spentInEnvelopes);
   const pendingFixed = totalFixed - paidFixed;
   const totalPlanned = totalFixed + totalEnvelopeBudgets;
   const totalPaidOrSpent = paidFixed + spentInEnvelopes;
@@ -284,10 +336,11 @@ function computeMonthSummary(data, mk) {
     totalIncome, receivedIncome, pendingIncome: totalIncome - receivedIncome,
     totalFixed, paidFixed, pendingFixed,
     totalEnvelopeBudgets, spentInEnvelopes,
+    envelopeApplied,
+    envelopePureReserved,
     envelopeReserved: Math.max(0, totalEnvelopeBudgets - spentInEnvelopes),
     totalPlanned, totalPaidOrSpent, totalPending: pendingFixed,
     freeSurplusProjected, freeSurplusCurrent, previousSurplus,
-    // Compatibilidade legada
     totalExpense: totalFixed + spentInEnvelopes,
     paidExpense: totalPaidOrSpent,
     pendingExpense: pendingFixed,
@@ -313,7 +366,8 @@ function computeBudgetStatus(data, mk) {
   for (const [catId, budgetAmount] of Object.entries(budgets)) {
     const cat = data.categories.find(c => c.id === catId);
     if (!cat) continue;
-    if (getCatBudgetType(data, catId) === 'fixed') continue; // skip fixed in envelopes
+    const bType = getCatBudgetType(data, catId);
+    if (bType === 'fixed' || bType === 'income') continue; // skip fixed and income
     const spent = entries.filter(e => e.categoryId === catId && e.status === 'paid').reduce((s, e) => s + (Number(e.amount) || 0), 0);
     const remaining = budgetAmount - spent;
     const pct = budgetAmount > 0 ? (spent / budgetAmount) * 100 : 0;
@@ -476,6 +530,7 @@ export default function App() {
             mk={mk}
             updateData={updateData}
             showToast={showToast}
+            onSetView={setView}
           />
         )}
         {view === 'goals' && (
@@ -511,6 +566,14 @@ export default function App() {
       <ScrollButtons />
 
       <BottomNav view={view} setView={setView} />
+
+      {/* Tutorial — aparece só no primeiro acesso após "Começar do zero" */}
+      {data.settings.onboarded && !data.settings.tutorialSeen && (
+        <TutorialModal
+          onClose={() => {}}
+          updateData={updateData}
+        />
+      )}
 
       {/* Modals */}
       {modal && (
@@ -577,6 +640,13 @@ const MONTH_SHORT = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out'
 function MonthPickerModal({ currentMonth, setCurrentMonth, onClose }) {
   const [pickerYear, setPickerYear] = useState(currentMonth.getFullYear());
   const currentMk = monthKey(currentMonth);
+
+  // Fix 3: travar scroll do fundo
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = prev; };
+  }, []);
 
   const select = (month) => {
     const d = new Date(pickerYear, month, 1);
@@ -805,6 +875,7 @@ function Onboarding({ onChoose }) {
   const startEmpty = () => {
     const d = EMPTY_DATA();
     d.settings.onboarded = true;
+    d.settings.tutorialSeen = false; // tutorial will show on first open
     onChoose(d);
   };
   const startExample = () => onChoose(EXAMPLE_DATA());
@@ -961,10 +1032,18 @@ function Dashboard({ data, mk, currentMonth, onSetView, onOpenModal, updateData,
         {/* 6 métricas */}
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginTop: 14 }}>
           <MetricTile label="Entradas" value={hide ? '••' : formatBRLShort(summary.totalIncome)} color={C.green} sub={summary.pendingIncome > 0 ? `${formatBRLShort(summary.pendingIncome)} pendente` : null} />
-          <MetricTile label="Destinado" value={hide ? '••' : formatBRLShort(summary.totalPlanned)} color={C.textSecondary} sub={`fixas + envelopes`} />
+          <MetricTile label="Destinado" value={hide ? '••' : formatBRLShort(summary.totalPlanned)} color={C.textSecondary} sub="fixas + envelopes" />
           <MetricTile label="Pago/Gasto" value={hide ? '••' : formatBRLShort(summary.totalPaidOrSpent)} color={C.blue} sub={null} />
           <MetricTile label="Pendente" value={hide ? '••' : formatBRLShort(summary.totalPending)} color={summary.totalPending > 0 ? C.orange : C.textTertiary} sub="contas fixas" />
-          <MetricTile label="Envelopes" value={hide ? '••' : formatBRLShort(summary.envelopeReserved)} color={C.textSecondary} sub="reservado" />
+          <MetricTile
+            label="Envelopes"
+            value={hide ? '••' : formatBRLShort(summary.envelopePureReserved)}
+            color={C.textSecondary}
+            sub={summary.envelopeApplied > 0
+              ? `+ ${formatBRLShort(summary.envelopeApplied)} aplicado`
+              : 'reservado'}
+            subColor={summary.envelopeApplied > 0 ? C.green : undefined}
+          />
           <MetricTile label="Livre agora" value={hide ? '••' : formatBRLShort(summary.freeSurplusCurrent)} color={summary.freeSurplusCurrent >= 0 ? C.green : C.red} sub="real atual" />
         </div>
 
@@ -996,9 +1075,9 @@ function Dashboard({ data, mk, currentMonth, onSetView, onOpenModal, updateData,
           icon={<Wallet size={16} />}
           color={C.blue}
           label="Envelopes"
-          mainValue={hide ? '••' : formatBRL(summary.spentInEnvelopes)}
+          mainValue={hide ? '••' : formatBRL(summary.spentInEnvelopes + summary.envelopeApplied)}
           subValue={hide ? '' : `de ${formatBRL(summary.totalEnvelopeBudgets)}`}
-          progress={summary.totalEnvelopeBudgets > 0 ? (summary.spentInEnvelopes / summary.totalEnvelopeBudgets) : 0}
+          progress={summary.totalEnvelopeBudgets > 0 ? ((summary.spentInEnvelopes + summary.envelopeApplied) / summary.totalEnvelopeBudgets) : 0}
         />
       </div>
 
@@ -1090,7 +1169,7 @@ function Dashboard({ data, mk, currentMonth, onSetView, onOpenModal, updateData,
           <button onClick={() => onSetView('goals')} style={textBtnStyle}>Ver todas</button>
         }>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {activeGoals.map(g => <GoalCard key={g.id} goal={g} hide={hide} compact />)}
+            {activeGoals.map(g => <GoalCard key={g.id} goal={g} hide={hide} onClick={() => onSetView('goals')} />)}
           </div>
         </Section>
       )}
@@ -1101,7 +1180,7 @@ function Dashboard({ data, mk, currentMonth, onSetView, onOpenModal, updateData,
           <button onClick={() => onSetView('goals')} style={textBtnStyle}>Ver todas</button>
         }>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {activeDebts.map(d => <DebtCard key={d.id} debt={d} hide={hide} compact />)}
+            {activeDebts.map(d => <DebtCard key={d.id} debt={d} hide={hide} onClick={() => onSetView('goals')} />)}
           </div>
         </Section>
       )}
@@ -1152,12 +1231,12 @@ function MiniStat({ label, value, color }) {
   );
 }
 
-function MetricTile({ label, value, color, sub }) {
+function MetricTile({ label, value, color, sub, subColor }) {
   return (
     <div style={{ background: C.cardElevated, borderRadius: 10, padding: '10px 10px' }}>
       <div style={{ fontSize: 10, color: C.textSecondary, fontWeight: 500, letterSpacing: '0.02em', textTransform: 'uppercase' }}>{label}</div>
       <div style={{ fontSize: 13, fontWeight: 700, color, marginTop: 3, letterSpacing: '-0.01em' }}>{value}</div>
-      {sub && <div style={{ fontSize: 10, color: C.textTertiary, marginTop: 2 }}>{sub}</div>}
+      {sub && <div style={{ fontSize: 10, color: subColor || C.textTertiary, marginTop: 2 }}>{sub}</div>}
     </div>
   );
 }
@@ -1328,55 +1407,101 @@ function BudgetMiniRow({ b, hide, isLast }) {
 // =====================================================
 // GOAL & DEBT CARDS
 // =====================================================
-function GoalCard({ goal, hide, compact, onClick }) {
+function GoalCard({ goal, hide, onClick, onQuickAporte }) {
   const saved = (goal.contributions || []).reduce((s, c) => s + (Number(c.amount)||0), 0);
   const pct = goal.target > 0 ? Math.min(100, (saved / goal.target) * 100) : 0;
+  const remaining = Math.max(0, goal.target - saved);
+  const isComplete = saved >= goal.target && goal.target > 0;
+
   return (
-    <div onClick={onClick} className={onClick ? 'mf-card mf-press' : ''} style={{
-      background: C.card, borderRadius: 14, padding: '14px 14px',
-      cursor: onClick ? 'pointer' : 'default',
-    }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 10 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-          <Target size={15} color={C.blue} />
-          <div style={{ fontSize: 15, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{goal.name}</div>
+    <div style={{ background: C.card, borderRadius: 14, overflow: 'hidden' }}>
+      {/* Main card area — clickable to edit */}
+      <div
+        onClick={onClick}
+        style={{ padding: '14px 14px 10px', cursor: onClick ? 'pointer' : 'default' }}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+            <Target size={15} color={isComplete ? C.green : C.blue} />
+            <div style={{ fontSize: 15, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{goal.name}</div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+            <div style={{ fontSize: 13, color: isComplete ? C.green : C.blue, fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>{pct.toFixed(0)}%</div>
+            {onClick && <ChevronRight size={14} color={C.textTertiary} />}
+          </div>
         </div>
-        <div style={{ fontSize: 13, color: C.blue, fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>{pct.toFixed(0)}%</div>
+        <div style={{ height: 6, borderRadius: 3, background: C.cardElevated, overflow: 'hidden' }}>
+          <div style={{ height: '100%', width: `${pct}%`, background: isComplete ? C.green : C.blue, transition: 'width 0.3s ease' }} />
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8, fontSize: 12 }}>
+          <span style={{ color: C.textSecondary }}>{hide ? '••' : formatBRL(saved)} <span style={{ color: C.textTertiary }}>de {hide ? '••' : formatBRL(goal.target)}</span></span>
+          <span style={{ color: isComplete ? C.green : C.textTertiary }}>
+            {isComplete ? '✓ Concluída' : `faltam ${hide ? '••' : formatBRL(remaining)}`}
+          </span>
+        </div>
       </div>
-      <div style={{ height: 6, borderRadius: 3, background: C.cardElevated, overflow: 'hidden' }}>
-        <div style={{ height: '100%', width: `${pct}%`, background: C.blue, transition: 'width 0.3s ease' }} />
-      </div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8, fontSize: 12 }}>
-        <span style={{ color: C.textSecondary }}>{hide ? '••' : formatBRL(saved)} <span style={{ color: C.textTertiary }}>de {hide ? '••' : formatBRL(goal.target)}</span></span>
-        <span style={{ color: C.textTertiary }}>faltam {hide ? '••' : formatBRL(Math.max(0, goal.target - saved))}</span>
-      </div>
+      {/* Quick action bar */}
+      {onQuickAporte && !isComplete && (
+        <div style={{ borderTop: `0.5px solid ${C.separator}`, padding: '0' }}>
+          <button onClick={onQuickAporte} style={{
+            width: '100%', padding: '10px 14px', background: 'transparent', border: 'none',
+            color: C.blue, fontSize: 13, fontWeight: 600, cursor: 'pointer',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+          }}>
+            <Plus size={14} /> Registrar aporte
+          </button>
+        </div>
+      )}
     </div>
   );
 }
 
-function DebtCard({ debt, hide, compact, onClick }) {
+function DebtCard({ debt, hide, onClick, onQuickPayment }) {
   const paid = (debt.payments || []).reduce((s, p) => s + (Number(p.amount)||0), 0);
   const pct = debt.total > 0 ? Math.min(100, (paid / debt.total) * 100) : 0;
+  const remaining = Math.max(0, debt.total - paid);
+  const isComplete = paid >= debt.total && debt.total > 0;
+
   return (
-    <div onClick={onClick} className={onClick ? 'mf-card mf-press' : ''} style={{
-      background: C.card, borderRadius: 14, padding: '14px 14px',
-      cursor: onClick ? 'pointer' : 'default',
-    }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 10 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-          <CreditCard size={15} color={C.orange} />
-          <div style={{ fontSize: 15, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{debt.name}</div>
-          {debt.creditor && <span style={{ fontSize: 12, color: C.textTertiary }}>· {debt.creditor}</span>}
+    <div style={{ background: C.card, borderRadius: 14, overflow: 'hidden' }}>
+      {/* Main card area — clickable to edit */}
+      <div
+        onClick={onClick}
+        style={{ padding: '14px 14px 10px', cursor: onClick ? 'pointer' : 'default' }}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+            <CreditCard size={15} color={isComplete ? C.green : C.orange} />
+            <div style={{ fontSize: 15, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{debt.name}</div>
+            {debt.creditor && <span style={{ fontSize: 12, color: C.textTertiary, flexShrink: 0 }}>· {debt.creditor}</span>}
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+            <div style={{ fontSize: 13, color: isComplete ? C.green : C.orange, fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>{pct.toFixed(0)}%</div>
+            {onClick && <ChevronRight size={14} color={C.textTertiary} />}
+          </div>
         </div>
-        <div style={{ fontSize: 13, color: C.orange, fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>{pct.toFixed(0)}%</div>
+        <div style={{ height: 6, borderRadius: 3, background: C.cardElevated, overflow: 'hidden' }}>
+          <div style={{ height: '100%', width: `${pct}%`, background: isComplete ? C.green : C.orange, transition: 'width 0.3s ease' }} />
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8, fontSize: 12 }}>
+          <span style={{ color: C.textSecondary }}>{hide ? '••' : formatBRL(paid)} <span style={{ color: C.textTertiary }}>de {hide ? '••' : formatBRL(debt.total)}</span></span>
+          <span style={{ color: isComplete ? C.green : C.textTertiary }}>
+            {isComplete ? '✓ Quitada' : `restam ${hide ? '••' : formatBRL(remaining)}`}
+          </span>
+        </div>
       </div>
-      <div style={{ height: 6, borderRadius: 3, background: C.cardElevated, overflow: 'hidden' }}>
-        <div style={{ height: '100%', width: `${pct}%`, background: C.orange, transition: 'width 0.3s ease' }} />
-      </div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8, fontSize: 12 }}>
-        <span style={{ color: C.textSecondary }}>{hide ? '••' : formatBRL(paid)} <span style={{ color: C.textTertiary }}>de {hide ? '••' : formatBRL(debt.total)}</span></span>
-        <span style={{ color: C.textTertiary }}>restam {hide ? '••' : formatBRL(Math.max(0, debt.total - paid))}</span>
-      </div>
+      {/* Quick action bar */}
+      {onQuickPayment && !isComplete && (
+        <div style={{ borderTop: `0.5px solid ${C.separator}` }}>
+          <button onClick={onQuickPayment} style={{
+            width: '100%', padding: '10px 14px', background: 'transparent', border: 'none',
+            color: C.orange, fontSize: 13, fontWeight: 600, cursor: 'pointer',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+          }}>
+            <Plus size={14} /> Registrar pagamento
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -1498,11 +1623,68 @@ function formatDateLabel(date) {
 // =====================================================
 // BUDGETS VIEW
 // =====================================================
-function BudgetsView({ data, mk, updateData, showToast }) {
+function BudgetsView({ data, mk, updateData, showToast, onSetView }) {
   const [editing, setEditing] = useState(null);
   const [tempValue, setTempValue] = useState('');
   const [envelopeInput, setEnvelopeInput] = useState(null);
-  const [envelopeLinkFor, setEnvelopeLinkFor] = useState(null); // category object
+  const [envelopeLinkFor, setEnvelopeLinkFor] = useState(null);
+  const [confirmRemove, setConfirmRemove] = useState(null); // { catId, isApplied, record }
+
+  const handleRemoveClick = (catId) => {
+    const applyKey = `${catId}_${mk}`;
+    const record = (data.envelopeLinkApplied || {})[applyKey];
+    const isApplied = !!record;
+    setConfirmRemove({ catId, isApplied, record: typeof record === 'object' ? record : null });
+  };
+
+  const doRemoveEnvelopeOnly = (catId) => {
+    // Remove só o budget entry — o valor aplicado continua contando via envelopeLinkApplied record
+    updateData(d => {
+      const m = { ...(d.budgets[mk] || {}) };
+      delete m[catId];
+      return { ...d, budgets: { ...d.budgets, [mk]: m } };
+    });
+    showToast('Envelope removido — aplicação mantida');
+    setConfirmRemove(null);
+  };
+
+  const doUndoApplication = (catId, record) => {
+    const applyKey = `${catId}_${mk}`;
+    updateData(d => {
+      // Remove budget entry
+      const m = { ...(d.budgets[mk] || {}) };
+      delete m[catId];
+      // Remove applied flag
+      const applied = { ...(d.envelopeLinkApplied || {}) };
+      delete applied[applyKey];
+      let newData = { ...d, budgets: { ...d.budgets, [mk]: m }, envelopeLinkApplied: applied };
+      // Remove o aporte/pagamento pelo entryId
+      if (record?.entryId) {
+        if (record.type === 'goal' && record.targetId) {
+          newData = { ...newData, goals: newData.goals.map(g => g.id === record.targetId ? {
+            ...g, contributions: (g.contributions || []).filter(c => c.id !== record.entryId)
+          } : g) };
+        } else if (record.type === 'debt' && record.targetId) {
+          newData = { ...newData, debts: newData.debts.map(x => x.id === record.targetId ? {
+            ...x, payments: (x.payments || []).filter(p => p.id !== record.entryId)
+          } : x) };
+        }
+      }
+      return newData;
+    });
+    showToast('Aplicação desfeita e envelope removido');
+    setConfirmRemove(null);
+  };
+
+  const doRemoveNormal = (catId) => {
+    updateData(d => {
+      const m = { ...(d.budgets[mk] || {}) };
+      delete m[catId];
+      return { ...d, budgets: { ...d.budgets, [mk]: m } };
+    });
+    showToast('Envelope removido');
+    setConfirmRemove(null);
+  };
   const status = useMemo(() => computeBudgetStatus(data, mk), [data, mk]);
   const fixedBills = useMemo(() => computeFixedBillsStatus(data, mk), [data, mk]);
   const expenseCats = data.categories.filter(c => c.type === 'expense' || c.type === 'both');
@@ -1517,14 +1699,6 @@ function BudgetsView({ data, mk, updateData, showToast }) {
       budgets: { ...d.budgets, [mk]: { ...(d.budgets[mk] || {}), [catId]: v } }
     }));
     showToast('Orçamento salvo', 'success');
-  };
-  const removeBudget = (catId) => {
-    updateData(d => {
-      const m = { ...(d.budgets[mk] || {}) };
-      delete m[catId];
-      return { ...d, budgets: { ...d.budgets, [mk]: m } };
-    });
-    showToast('Orçamento removido');
   };
 
   const totalEnv = status.reduce((s, b) => s + b.budget, 0);
@@ -1608,7 +1782,7 @@ function BudgetsView({ data, mk, updateData, showToast }) {
                         </div>
                       </div>
                     </div>
-                    <button onClick={() => removeBudget(b.categoryId)}
+                    <button onClick={() => handleRemoveClick(b.categoryId)}
                       style={{ background: 'none', border: 'none', color: C.textTertiary, cursor: 'pointer', padding: 4, display: 'flex' }}>
                       <Trash2 size={15} />
                     </button>
@@ -1643,9 +1817,37 @@ function BudgetsView({ data, mk, updateData, showToast }) {
                       </button>
                     )}
                   </div>
-                  <div style={{ fontSize: 12, color: C.textTertiary, marginTop: 4, textAlign: 'right' }}>
-                    {b.pct.toFixed(0)}% usado · reservado, não é sobra livre
-                  </div>
+                  {/* Status do envelope: reservado / gasto / aplicado */}
+                  {(() => {
+                    const isApplied = !!(data.envelopeLinkApplied || {})[`${b.categoryId}_${mk}`];
+                    const link = (data.envelopeLinks || {})[b.categoryId];
+                    if (isApplied && link?.targetId) {
+                      const targetName = link.type === 'goal'
+                        ? data.goals.find(g => g.id === link.targetId)?.name
+                        : data.debts.find(x => x.id === link.targetId)?.name;
+                      return (
+                        <div style={{ fontSize: 12, marginTop: 4, textAlign: 'right', color: C.green }}>
+                          ✓ {link.type === 'goal' ? 'Guardado' : 'Pago'} → {targetName || '—'}
+                        </div>
+                      );
+                    }
+                    if (b.spent > 0 && b.spent >= b.budget) {
+                      return <div style={{ fontSize: 12, marginTop: 4, textAlign: 'right', color: C.textTertiary }}>100% utilizado</div>;
+                    }
+                    return (
+                      <div style={{ fontSize: 12, color: C.textTertiary, marginTop: 4, textAlign: 'right' }}>
+                        {b.pct.toFixed(0)}% usado · reservado, não é sobra livre
+                      </div>
+                    );
+                  })()}
+                  {/* Dica: como lançar gasto neste envelope */}
+                  {b.spent === 0 && (
+                    <div style={{ marginTop: 8, padding: '8px 10px', background: C.cardElevated, borderRadius: 8 }}>
+                      <div style={{ fontSize: 11, color: C.textTertiary, lineHeight: 1.5 }}>
+                        💡 Para registrar um gasto aqui, use o <strong style={{ color: C.blue }}>+</strong> → Despesa → escolha a categoria <strong>{b.category.name}</strong>
+                      </div>
+                    </div>
+                  )}
                   {/* Vínculo com meta/dívida */}
                   {(() => {
                     const link = (data.envelopeLinks || {})[b.categoryId];
@@ -1657,10 +1859,10 @@ function BudgetsView({ data, mk, updateData, showToast }) {
                       return (
                         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 8, padding: '8px 10px', background: isApplied ? C.greenDim : C.blueDim, borderRadius: 8 }}>
                           <div style={{ fontSize: 12, color: isApplied ? C.green : C.blue }}>
-                            {isApplied ? '✓ Aplicado' : '⟶'} {link.type === 'goal' ? '🎯' : '💳'} {target?.name || '—'}
+                            {isApplied ? `✓ ${formatBRL(b.budget)} aplicado` : `⟶ ${formatBRL(b.budget)}`} {link.type === 'goal' ? '🎯' : '💳'} {target?.name || '—'}
                           </div>
                           <button onClick={() => setEnvelopeLinkFor(b.category)} style={{ background: 'none', border: 'none', color: isApplied ? C.green : C.blue, fontSize: 12, cursor: 'pointer', padding: 0 }}>
-                            {isApplied ? 'Ver' : 'Aplicar'}
+                            {isApplied ? 'Ver →' : 'Aplicar'}
                           </button>
                         </div>
                       );
@@ -1705,6 +1907,16 @@ function BudgetsView({ data, mk, updateData, showToast }) {
         </Section>
       )}
 
+      {unbudgeted.length === 0 && envelopeCats.length > 0 && (
+        <div style={{ background: C.card, borderRadius: 14, padding: '16px 16px', textAlign: 'center' }}>
+          <div style={{ fontSize: 20, marginBottom: 6 }}>✓</div>
+          <div style={{ fontSize: 14, fontWeight: 600, color: C.textPrimary, marginBottom: 4 }}>Todos os envelopes definidos</div>
+          <div style={{ fontSize: 13, color: C.textSecondary }}>
+            Use o botão <strong style={{ color: C.blue }}>+</strong> para lançar gastos em cada categoria.
+          </div>
+        </div>
+      )}
+
       {envelopeInput && (
         <EnvelopeInputModal
           category={envelopeInput}
@@ -1722,7 +1934,54 @@ function BudgetsView({ data, mk, updateData, showToast }) {
           updateData={updateData}
           showToast={showToast}
           onClose={() => setEnvelopeLinkFor(null)}
+          onNavigateGoals={() => onSetView?.('goals')}
         />
+      )}
+
+      {confirmRemove && !confirmRemove.isApplied && (
+        <ConfirmModal
+          title="Remover envelope"
+          message="O limite deste envelope será removido neste mês. Os lançamentos não serão apagados."
+          confirmLabel="Remover"
+          danger
+          onConfirm={() => doRemoveNormal(confirmRemove.catId)}
+          onClose={() => setConfirmRemove(null)}
+        />
+      )}
+
+      {confirmRemove && confirmRemove.isApplied && (
+        <ActionSheet title="Envelope já aplicado" onClose={() => setConfirmRemove(null)}>
+          <div style={{ fontSize: 14, color: C.textSecondary, marginBottom: 16, lineHeight: 1.5 }}>
+            Este envelope já foi aplicado em uma {confirmRemove.record?.type === 'goal' ? 'meta' : 'dívida'}.
+            {confirmRemove.record?.amount ? ` O valor de ${formatBRL(confirmRemove.record.amount)} continua registrado lá.` : ''}
+          </div>
+          <button onClick={() => doRemoveEnvelopeOnly(confirmRemove.catId)} style={{
+            width: '100%', padding: '14px 16px', background: C.cardElevated, border: 'none',
+            color: C.textPrimary, borderRadius: 12, fontSize: 15, fontWeight: 600,
+            cursor: 'pointer', marginBottom: 10, textAlign: 'left',
+          }}>
+            <div style={{ fontWeight: 700 }}>Remover só o envelope</div>
+            <div style={{ fontSize: 12, color: C.textSecondary, marginTop: 3 }}>
+              O valor aplicado continua contando como destinado no mês
+            </div>
+          </button>
+          {confirmRemove.record?.entryId && (
+            <button onClick={() => doUndoApplication(confirmRemove.catId, confirmRemove.record)} style={{
+              width: '100%', padding: '14px 16px', background: C.redDim, border: 'none',
+              color: C.red, borderRadius: 12, fontSize: 15, fontWeight: 600,
+              cursor: 'pointer', marginBottom: 10, textAlign: 'left',
+            }}>
+              <div style={{ fontWeight: 700 }}>Desfazer aplicação e remover</div>
+              <div style={{ fontSize: 12, color: C.red, opacity: 0.8, marginTop: 3 }}>
+                Remove o envelope e o aporte/pagamento da {confirmRemove.record?.type === 'goal' ? 'meta' : 'dívida'}
+              </div>
+            </button>
+          )}
+          <button onClick={() => setConfirmRemove(null)} style={{
+            width: '100%', padding: '13px', background: 'transparent', border: 'none',
+            color: C.textSecondary, fontSize: 15, cursor: 'pointer',
+          }}>Cancelar</button>
+        </ActionSheet>
       )}
     </div>
   );
@@ -1731,90 +1990,173 @@ function BudgetsView({ data, mk, updateData, showToast }) {
 // =====================================================
 // GOALS & DEBTS VIEW
 // =====================================================
-function GoalsDebtsView({ data, updateData, onOpenModal, showToast }) {
-  const [tab, setTab] = useState('goals');
-  const hide = data.settings.hideBalances;
+// Quick aporte / pagamento modal
+function QuickAmountModal({ title, subtitle, color, onSave, onClose }) {
+  const [value, setValue] = useState('');
+  const inputRef = useRef(null);
+  useEffect(() => { setTimeout(() => inputRef.current?.focus(), 100); }, []);
+
+  const submit = () => {
+    const v = Number(String(value).replace(',', '.'));
+    if (!v || v <= 0) return;
+    onSave(v);
+    onClose();
+  };
 
   return (
-    <div style={{ paddingTop: 16, display: 'flex', flexDirection: 'column', gap: 14 }}>
-      <div style={{ display: 'flex', gap: 4, background: C.card, borderRadius: 10, padding: 4 }}>
-        {[{ id: 'goals', label: 'Metas' }, { id: 'debts', label: 'Dívidas' }].map(t => (
-          <button key={t.id} onClick={() => setTab(t.id)} style={{
-            flex: 1, padding: '8px 0', borderRadius: 7, fontSize: 14, fontWeight: 600,
-            background: tab === t.id ? C.cardElevated : 'transparent',
-            color: tab === t.id ? C.textPrimary : C.textSecondary,
-            border: 'none', cursor: 'pointer',
-            transition: 'all 0.15s ease',
-          }}>
-            {t.label}
-          </button>
-        ))}
+    <ActionSheet title={title} onClose={onClose}>
+      {subtitle && <div style={{ fontSize: 13, color: C.textSecondary, marginBottom: 12 }}>{subtitle}</div>}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: C.bg, borderRadius: 12, padding: '12px 16px', marginBottom: 16 }}>
+        <span style={{ fontSize: 18, color: C.textSecondary, fontWeight: 700 }}>R$</span>
+        <input
+          ref={inputRef}
+          type="number" inputMode="decimal" placeholder="0,00"
+          value={value} onChange={e => setValue(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && submit()}
+          style={{ flex: 1, background: 'transparent', border: 'none', color: C.textPrimary, fontSize: 26, fontWeight: 700, letterSpacing: '-0.02em' }}
+        />
+      </div>
+      <button onClick={submit} style={{
+        width: '100%', padding: '15px', background: color || C.blue, border: 'none',
+        color: '#fff', borderRadius: 14, fontSize: 17, fontWeight: 700, cursor: 'pointer',
+      }}>Salvar</button>
+      <button onClick={onClose} style={{
+        width: '100%', padding: '13px', background: 'transparent', border: 'none',
+        color: C.textSecondary, fontSize: 15, cursor: 'pointer', marginTop: 8,
+      }}>Cancelar</button>
+    </ActionSheet>
+  );
+}
+
+function GoalsDebtsView({ data, updateData, onOpenModal, showToast }) {
+  const [tab, setTab] = useState('goals');
+  const [quickAporte, setQuickAporte] = useState(null); // goal object
+  const [quickPayment, setQuickPayment] = useState(null); // debt object
+  const hide = data.settings.hideBalances;
+
+  const addContribution = (goal, amount) => {
+    updateData(d => ({
+      ...d,
+      goals: d.goals.map(g => g.id === goal.id ? {
+        ...g, contributions: [...(g.contributions || []), { id: uid(), date: todayKey(), amount, note: '' }]
+      } : g)
+    }));
+    showToast('Aporte registrado', 'success');
+  };
+
+  const addPayment = (debt, amount) => {
+    updateData(d => ({
+      ...d,
+      debts: d.debts.map(x => x.id === debt.id ? {
+        ...x, payments: [...(x.payments || []), { id: uid(), date: todayKey(), amount, note: '' }]
+      } : x)
+    }));
+    showToast('Pagamento registrado', 'success');
+  };
+
+  return (
+    <>
+      <div style={{ paddingTop: 16, display: 'flex', flexDirection: 'column', gap: 14 }}>
+        <div style={{ display: 'flex', gap: 4, background: C.card, borderRadius: 10, padding: 4 }}>
+          {[{ id: 'goals', label: 'Metas' }, { id: 'debts', label: 'Dívidas' }].map(t => (
+            <button key={t.id} onClick={() => setTab(t.id)} style={{
+              flex: 1, padding: '8px 0', borderRadius: 7, fontSize: 14, fontWeight: 600,
+              background: tab === t.id ? C.cardElevated : 'transparent',
+              color: tab === t.id ? C.textPrimary : C.textSecondary,
+              border: 'none', cursor: 'pointer', transition: 'all 0.15s ease',
+            }}>{t.label}</button>
+          ))}
+        </div>
+
+        {tab === 'goals' && (
+          <>
+            {data.goals.filter(g => !g.parentId).length === 0 ? (
+              <EmptyState
+                icon={<Target size={32} color={C.blue} />}
+                title="Nenhuma meta ainda"
+                text="Crie metas para acompanhar seu progresso de poupança."
+                actionLabel="Nova meta"
+                onAction={() => onOpenModal({ type: 'edit-goal', payload: null })}
+              />
+            ) : (
+              <>
+                {data.goals.filter(g => !g.parentId).map(g => {
+                  const subs = data.goals.filter(x => x.parentId === g.id);
+                  return (
+                    <div key={g.id}>
+                      <GoalCard
+                        goal={g} hide={hide}
+                        onClick={() => onOpenModal({ type: 'edit-goal', payload: g })}
+                        onQuickAporte={() => setQuickAporte(g)}
+                      />
+                      {subs.length > 0 && (
+                        <div style={{ marginLeft: 16, marginTop: 6, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                          {subs.map(s => (
+                            <GoalCard key={s.id} goal={s} hide={hide}
+                              onClick={() => onOpenModal({ type: 'edit-goal', payload: s })}
+                              onQuickAporte={() => setQuickAporte(s)}
+                            />
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+                <button onClick={() => onOpenModal({ type: 'edit-goal', payload: null })} className="mf-press" style={addBtnStyle}>
+                  <Plus size={18} /> Nova meta
+                </button>
+              </>
+            )}
+          </>
+        )}
+
+        {tab === 'debts' && (
+          <>
+            {data.debts.length === 0 ? (
+              <EmptyState
+                icon={<CreditCard size={32} color={C.orange} />}
+                title="Sem dívidas registradas"
+                text="Cadastre dívidas para acompanhar a quitação."
+                actionLabel="Nova dívida"
+                onAction={() => onOpenModal({ type: 'edit-debt', payload: null })}
+              />
+            ) : (
+              <>
+                {data.debts.map(d => (
+                  <DebtCard key={d.id} debt={d} hide={hide}
+                    onClick={() => onOpenModal({ type: 'edit-debt', payload: d })}
+                    onQuickPayment={() => setQuickPayment(d)}
+                  />
+                ))}
+                <button onClick={() => onOpenModal({ type: 'edit-debt', payload: null })} className="mf-press" style={addBtnStyle}>
+                  <Plus size={18} /> Nova dívida
+                </button>
+              </>
+            )}
+          </>
+        )}
       </div>
 
-      {tab === 'goals' && (
-        <>
-          {data.goals.filter(g => !g.parentId).length === 0 ? (
-            <EmptyState
-              icon={<Target size={32} color={C.blue} />}
-              title="Nenhuma meta ainda"
-              text="Crie metas para acompanhar progresso."
-              actionLabel="Nova meta"
-              onAction={() => onOpenModal({ type: 'edit-goal', payload: null })}
-            />
-          ) : (
-            <>
-              {data.goals.filter(g => !g.parentId).map(g => {
-                const subs = data.goals.filter(x => x.parentId === g.id);
-                return (
-                  <div key={g.id}>
-                    <GoalCard goal={g} hide={hide} onClick={() => onOpenModal({ type: 'edit-goal', payload: g })} />
-                    {subs.length > 0 && (
-                      <div style={{ marginLeft: 16, marginTop: 6, display: 'flex', flexDirection: 'column', gap: 6 }}>
-                        {subs.map(s => <GoalCard key={s.id} goal={s} hide={hide} onClick={() => onOpenModal({ type: 'edit-goal', payload: s })} />)}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-              <button
-                onClick={() => onOpenModal({ type: 'edit-goal', payload: null })}
-                className="mf-press"
-                style={addBtnStyle}
-              >
-                <Plus size={18} /> Nova meta
-              </button>
-            </>
-          )}
-        </>
+      {quickAporte && (
+        <QuickAmountModal
+          title={`Aporte — ${quickAporte.name}`}
+          subtitle={`Guardado: ${formatBRL((quickAporte.contributions||[]).reduce((s,c)=>s+(Number(c.amount)||0),0))} de ${formatBRL(quickAporte.target)}`}
+          color={C.blue}
+          onSave={(v) => addContribution(quickAporte, v)}
+          onClose={() => setQuickAporte(null)}
+        />
       )}
 
-      {tab === 'debts' && (
-        <>
-          {data.debts.length === 0 ? (
-            <EmptyState
-              icon={<CreditCard size={32} color={C.orange} />}
-              title="Sem dívidas registradas"
-              text="Cadastre dívidas para acompanhar quitação."
-              actionLabel="Nova dívida"
-              onAction={() => onOpenModal({ type: 'edit-debt', payload: null })}
-            />
-          ) : (
-            <>
-              {data.debts.map(d => (
-                <DebtCard key={d.id} debt={d} hide={hide} onClick={() => onOpenModal({ type: 'edit-debt', payload: d })} />
-              ))}
-              <button
-                onClick={() => onOpenModal({ type: 'edit-debt', payload: null })}
-                className="mf-press"
-                style={addBtnStyle}
-              >
-                <Plus size={18} /> Nova dívida
-              </button>
-            </>
-          )}
-        </>
+      {quickPayment && (
+        <QuickAmountModal
+          title={`Pagamento — ${quickPayment.name}`}
+          subtitle={`Pago: ${formatBRL((quickPayment.payments||[]).reduce((s,p)=>s+(Number(p.amount)||0),0))} de ${formatBRL(quickPayment.total)}`}
+          color={C.orange}
+          onSave={(v) => addPayment(quickPayment, v)}
+          onClose={() => setQuickPayment(null)}
+        />
       )}
-    </div>
+    </>
   );
 }
 
@@ -1994,6 +2336,7 @@ function SettingsView({ data, updateData, setData, showToast, openModal }) {
   const [showPlanning, setShowPlanning] = useState(false);
   const [showCategories, setShowCategories] = useState(false);
   const [showRecurrences, setShowRecurrences] = useState(false);
+  const [showTutorial, setShowTutorial] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const [confirmExample, setConfirmExample] = useState(false);
   const fileInputRef = useRef(null);
@@ -2065,6 +2408,12 @@ function SettingsView({ data, updateData, setData, showToast, openModal }) {
           </div>
         </Section>
 
+        <Section title="Ajuda">
+          <div style={{ background: C.card, borderRadius: 14, overflow: 'hidden' }}>
+            <SettingRow Icon={Info} label="Como usar o Financial Math" onClick={() => setShowTutorial(true)} isLast />
+          </div>
+        </Section>
+
         <Section title="Dados">
           <div style={{ background: C.card, borderRadius: 14, overflow: 'hidden' }}>
             <SettingRow Icon={FileDown} label="Exportar backup" onClick={exportData} />
@@ -2102,6 +2451,13 @@ function SettingsView({ data, updateData, setData, showToast, openModal }) {
           confirmLabel="Carregar exemplo"
           onConfirm={doLoadExample}
           onClose={() => setConfirmExample(false)}
+        />
+      )}
+
+      {showTutorial && (
+        <TutorialModal
+          onClose={() => setShowTutorial(false)}
+          updateData={updateData}
         />
       )}
     </>
@@ -2153,10 +2509,11 @@ function PlanningSubView({ data, updateData, showToast }) {
 // =====================================================
 // ENVELOPE LINK MODAL
 // =====================================================
-function EnvelopeLinkModal({ category, data, mk, onClose, updateData, showToast }) {
+function EnvelopeLinkModal({ category, data, mk, onClose, updateData, showToast, onNavigateGoals }) {
   const link = (data.envelopeLinks || {})[category.id];
   const [type, setType] = useState(link?.type || 'none');
   const [targetId, setTargetId] = useState(link?.targetId || '');
+  const [confirmApply, setConfirmApply] = useState(false);
 
   const goals = data.goals.filter(g => !g.parentId);
   const debts = data.debts;
@@ -2173,105 +2530,233 @@ function EnvelopeLinkModal({ category, data, mk, onClose, updateData, showToast 
     onClose();
   };
 
-  const applyNow = () => {
+  const doApply = () => {
     const applyKey = `${category.id}_${mk}`;
+    // Proteção programática contra dupla execução (independente da UI)
     if ((data.envelopeLinkApplied || {})[applyKey]) {
       showToast('Já aplicado neste mês', 'error');
+      setConfirmApply(false);
       onClose();
       return;
     }
     const amount = (data.budgets[mk] || {})[category.id] || 0;
-    if (amount <= 0) { showToast('Defina um valor para o envelope primeiro', 'error'); return; }
+    if (!amount || amount <= 0) {
+      showToast('Defina um valor para o envelope antes de aplicar', 'error');
+      setConfirmApply(false);
+      return;
+    }
+    const liveType = type || link?.type;
+    const liveTargetId = targetId || link?.targetId;
+    const entryId = uid(); // ID do aporte/pagamento gerado — permite desfazer depois
 
     updateData(d => {
-      let newData = { ...d, envelopeLinkApplied: { ...(d.envelopeLinkApplied || {}), [applyKey]: true } };
-      if (type === 'goal' && targetId) {
-        newData = { ...newData, goals: newData.goals.map(g => g.id === targetId ? {
-          ...g, contributions: [...(g.contributions || []), { id: uid(), date: todayKey(), amount, note: `Envelope ${category.name} — ${monthShort(parseMonthKey(mk))}` }]
+      // Armazena objeto rico (não apenas true) para permitir undo e cálculo sem budget entry
+      const appliedRecord = { amount, type: liveType, targetId: liveTargetId, entryId };
+      let newData = { ...d, envelopeLinkApplied: { ...(d.envelopeLinkApplied || {}), [applyKey]: appliedRecord } };
+      if (liveType === 'goal' && liveTargetId) {
+        newData = { ...newData, goals: newData.goals.map(g => g.id === liveTargetId ? {
+          ...g, contributions: [...(g.contributions || []), { id: entryId, date: todayKey(), amount, note: `Envelope ${category.name} — ${monthShort(parseMonthKey(mk))}` }]
         } : g) };
-      } else if (type === 'debt' && targetId) {
-        newData = { ...newData, debts: newData.debts.map(x => x.id === targetId ? {
-          ...x, payments: [...(x.payments || []), { id: uid(), date: todayKey(), amount, note: `Envelope ${category.name} — ${monthShort(parseMonthKey(mk))}` }]
+      } else if (liveType === 'debt' && liveTargetId) {
+        newData = { ...newData, debts: newData.debts.map(x => x.id === liveTargetId ? {
+          ...x, payments: [...(x.payments || []), { id: entryId, date: todayKey(), amount, note: `Envelope ${category.name} — ${monthShort(parseMonthKey(mk))}` }]
         } : x) };
       }
       return newData;
     });
     showToast(`${formatBRL(amount)} aplicado com sucesso`, 'success');
+    setConfirmApply(false);
     onClose();
   };
 
   const currentLink = (data.envelopeLinks || {})[category.id];
   const isApplied = !!(data.envelopeLinkApplied || {})[`${category.id}_${mk}`];
+  const amount = (data.budgets[mk] || {})[category.id] || 0;
+
+  const getTargetName = () => {
+    if (!currentLink || !currentLink.targetId) return '—';
+    if (currentLink.type === 'goal') return data.goals.find(g => g.id === currentLink.targetId)?.name || '—';
+    return data.debts.find(x => x.id === currentLink.targetId)?.name || '—';
+  };
 
   return (
-    <ActionSheet title={`Vincular — ${category.name}`} onClose={onClose}>
-      <div style={{ marginBottom: 14 }}>
-        <div style={{ fontSize: 12, color: C.textTertiary, fontWeight: 600, marginBottom: 8 }}>VINCULAR A</div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {[
-            { id: 'none', label: 'Nenhum vínculo' },
-            { id: 'goal', label: '🎯 Meta' },
-            { id: 'debt', label: '💳 Dívida' },
-          ].map(opt => (
-            <button key={opt.id} onClick={() => { setType(opt.id); setTargetId(''); }} style={{
-              padding: '12px 16px', borderRadius: 10, border: 'none', cursor: 'pointer', textAlign: 'left',
-              background: type === opt.id ? C.blueDim : C.cardElevated,
-              color: type === opt.id ? C.blue : C.textPrimary,
-              fontSize: 15, fontWeight: type === opt.id ? 600 : 400,
-              display: 'flex', alignItems: 'center', gap: 10,
-            }}>
-              <div style={{ width: 18, height: 18, borderRadius: 9, border: `2px solid ${type === opt.id ? C.blue : C.textTertiary}`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                {type === opt.id && <div style={{ width: 8, height: 8, borderRadius: 4, background: C.blue }} />}
-              </div>
-              {opt.label}
-            </button>
+    <>
+      <ActionSheet title={`Vincular — ${category.name}`} onClose={onClose}>
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 12, color: C.textTertiary, fontWeight: 600, marginBottom: 8 }}>VINCULAR A</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {[
+              { id: 'none', label: 'Nenhum vínculo' },
+              { id: 'goal', label: '🎯 Meta' },
+              { id: 'debt', label: '💳 Dívida' },
+            ].map(opt => (
+              <button key={opt.id} onClick={() => { setType(opt.id); setTargetId(''); }} style={{
+                padding: '12px 16px', borderRadius: 10, border: 'none', cursor: 'pointer', textAlign: 'left',
+                background: type === opt.id ? C.blueDim : C.cardElevated,
+                color: type === opt.id ? C.blue : C.textPrimary,
+                fontSize: 15, fontWeight: type === opt.id ? 600 : 400,
+                display: 'flex', alignItems: 'center', gap: 10,
+              }}>
+                <div style={{ width: 18, height: 18, borderRadius: 9, border: `2px solid ${type === opt.id ? C.blue : C.textTertiary}`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  {type === opt.id && <div style={{ width: 8, height: 8, borderRadius: 4, background: C.blue }} />}
+                </div>
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {type === 'goal' && goals.length > 0 && (
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ fontSize: 12, color: C.textTertiary, fontWeight: 600, marginBottom: 8 }}>QUAL META</div>
+            <select value={targetId} onChange={e => setTargetId(e.target.value)} style={{ width: '100%', background: C.bg, color: C.textPrimary, border: `1px solid ${C.separator}`, borderRadius: 10, padding: '12px 14px', fontSize: 15 }}>
+              <option value="">Selecione uma meta</option>
+              {goals.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
+            </select>
+          </div>
+        )}
+
+        {type === 'debt' && debts.length > 0 && (
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ fontSize: 12, color: C.textTertiary, fontWeight: 600, marginBottom: 8 }}>QUAL DÍVIDA</div>
+            <select value={targetId} onChange={e => setTargetId(e.target.value)} style={{ width: '100%', background: C.bg, color: C.textPrimary, border: `1px solid ${C.separator}`, borderRadius: 10, padding: '12px 14px', fontSize: 15 }}>
+              <option value="">Selecione uma dívida</option>
+              {debts.map(x => <option key={x.id} value={x.id}>{x.name}</option>)}
+            </select>
+          </div>
+        )}
+
+        <button onClick={save} style={{ width: '100%', padding: '15px', background: C.blue, border: 'none', color: '#fff', borderRadius: 12, fontSize: 16, fontWeight: 700, cursor: 'pointer', marginBottom: 10 }}>
+          Salvar vínculo
+        </button>
+
+        {/* Aplicar com preview */}
+        {currentLink && currentLink.type !== 'none' && currentLink.targetId && !isApplied && amount > 0 && (
+          <button onClick={() => setConfirmApply(true)} style={{
+            width: '100%', padding: '13px', background: C.greenDim, border: 'none',
+            color: C.green, borderRadius: 12, fontSize: 15, fontWeight: 600, cursor: 'pointer', marginBottom: 10,
+          }}>
+            ✓ Aplicar {formatBRL(amount)} → {getTargetName()}
+          </button>
+        )}
+
+        {/* "Ver" navega direto para a aba Metas/Dívidas */}
+        {currentLink && currentLink.type !== 'none' && currentLink.targetId && isApplied && (
+          <button onClick={() => { onClose(); onNavigateGoals?.(); }} style={{
+            width: '100%', padding: '13px', background: C.cardElevated, border: 'none',
+            color: C.textSecondary, borderRadius: 12, fontSize: 15, cursor: 'pointer', marginBottom: 10,
+            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+          }}>
+            <span style={{ color: C.green }}>✓ Aplicado em {monthShort(parseMonthKey(mk))}</span>
+            <span style={{ color: C.blue }}>· Ver {currentLink.type === 'goal' ? 'meta' : 'dívida'} →</span>
+          </button>
+        )}
+
+        <button onClick={onClose} style={{ width: '100%', padding: '13px', background: 'transparent', border: 'none', color: C.textSecondary, fontSize: 15, cursor: 'pointer' }}>
+          Cancelar
+        </button>
+      </ActionSheet>
+
+      {/* Preview de aplicação */}
+      {confirmApply && (
+        <ConfirmModal
+          title="Confirmar aplicação"
+          message={`Isso vai registrar ${formatBRL(amount)} como ${currentLink?.type === 'goal' ? 'aporte na meta' : 'pagamento da dívida'} "${getTargetName()}". Essa ação não poderá ser desfeita automaticamente.`}
+          confirmLabel={`Aplicar ${formatBRL(amount)}`}
+          onConfirm={doApply}
+          onClose={() => setConfirmApply(false)}
+        />
+      )}
+    </>
+  );
+}
+
+// =====================================================
+// TUTORIAL — primeiros passos (discreto, fechável)
+// =====================================================
+const TUTORIAL_STEPS = [
+  {
+    icon: '💰',
+    title: 'Cadastre suas entradas',
+    text: 'Adicione seu salário e outras receitas. Use o botão + azul ou crie recorrências para o que entra todo mês.',
+  },
+  {
+    icon: '📋',
+    title: 'Defina seus envelopes',
+    text: 'Na aba Orçamentos, separe um limite para cada categoria de gasto: Alimentação, Transporte, Lazer etc.',
+  },
+  {
+    icon: '📌',
+    title: 'Registre contas fixas',
+    text: 'Contas que você paga todo mês (internet, assinaturas) vão em categorias do tipo Fixa, também com o botão +.',
+  },
+  {
+    icon: '✅',
+    title: 'Lance seus gastos',
+    text: 'A cada compra ou pagamento, use o botão + para registrar. O dashboard atualiza a sobra livre na hora.',
+  },
+];
+
+function TutorialModal({ onClose, updateData }) {
+  const [step, setStep] = useState(0);
+  const isLast = step === TUTORIAL_STEPS.length - 1;
+  const s = TUTORIAL_STEPS[step];
+
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = prev; };
+  }, []);
+
+  const finish = () => {
+    updateData(d => ({ ...d, settings: { ...d.settings, tutorialSeen: true } }));
+    onClose();
+  };
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 300,
+      background: 'rgba(0,0,0,0.75)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      padding: 24,
+      animation: 'overlay-in 0.2s ease',
+    }}>
+      <div style={{
+        background: C.card, borderRadius: 22, padding: '28px 24px 24px',
+        width: '100%', maxWidth: 340,
+        animation: 'modal-in 0.25s ease-out',
+        textAlign: 'center',
+      }}>
+        {/* Progress dots */}
+        <div style={{ display: 'flex', justifyContent: 'center', gap: 6, marginBottom: 24 }}>
+          {TUTORIAL_STEPS.map((_, i) => (
+            <div key={i} style={{
+              width: i === step ? 20 : 6, height: 6, borderRadius: 3,
+              background: i === step ? C.blue : C.separator,
+              transition: 'width 0.2s ease, background 0.2s ease',
+            }} />
           ))}
         </div>
-      </div>
 
-      {type === 'goal' && goals.length > 0 && (
-        <div style={{ marginBottom: 14 }}>
-          <div style={{ fontSize: 12, color: C.textTertiary, fontWeight: 600, marginBottom: 8 }}>QUAL META</div>
-          <select value={targetId} onChange={e => setTargetId(e.target.value)} style={{ width: '100%', background: C.bg, color: C.textPrimary, border: `1px solid ${C.separator}`, borderRadius: 10, padding: '12px 14px', fontSize: 15 }}>
-            <option value="">Selecione uma meta</option>
-            {goals.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
-          </select>
-        </div>
-      )}
+        <div style={{ fontSize: 48, marginBottom: 16 }}>{s.icon}</div>
+        <div style={{ fontSize: 20, fontWeight: 700, marginBottom: 10, letterSpacing: '-0.02em' }}>{s.title}</div>
+        <div style={{ fontSize: 15, color: C.textSecondary, lineHeight: 1.5, marginBottom: 28 }}>{s.text}</div>
 
-      {type === 'debt' && debts.length > 0 && (
-        <div style={{ marginBottom: 14 }}>
-          <div style={{ fontSize: 12, color: C.textTertiary, fontWeight: 600, marginBottom: 8 }}>QUAL DÍVIDA</div>
-          <select value={targetId} onChange={e => setTargetId(e.target.value)} style={{ width: '100%', background: C.bg, color: C.textPrimary, border: `1px solid ${C.separator}`, borderRadius: 10, padding: '12px 14px', fontSize: 15 }}>
-            <option value="">Selecione uma dívida</option>
-            {debts.map(x => <option key={x.id} value={x.id}>{x.name}</option>)}
-          </select>
-        </div>
-      )}
-
-      <button onClick={save} style={{ width: '100%', padding: '15px', background: C.blue, border: 'none', color: '#fff', borderRadius: 12, fontSize: 16, fontWeight: 700, cursor: 'pointer', marginBottom: 10 }}>
-        Salvar vínculo
-      </button>
-
-      {/* Apply now button — only shows when there's an active link and not yet applied this month */}
-      {currentLink && currentLink.type !== 'none' && currentLink.targetId && !isApplied && (
-        <button onClick={applyNow} style={{
-          width: '100%', padding: '13px', background: C.greenDim, border: 'none',
-          color: C.green, borderRadius: 12, fontSize: 15, fontWeight: 600, cursor: 'pointer', marginBottom: 10,
+        <button onClick={() => isLast ? finish() : setStep(i => i + 1)} style={{
+          width: '100%', padding: '15px', background: C.blue, border: 'none',
+          color: '#fff', borderRadius: 14, fontSize: 16, fontWeight: 700, cursor: 'pointer',
+          marginBottom: 10,
         }}>
-          ✓ Aplicar ao {currentLink.type === 'goal' ? 'meta' : 'dívida'} agora ({monthShort(parseMonthKey(mk))})
+          {isLast ? 'Começar a usar' : 'Próximo'}
         </button>
-      )}
-      {currentLink && currentLink.type !== 'none' && currentLink.targetId && isApplied && (
-        <div style={{ textAlign: 'center', fontSize: 13, color: C.green, padding: '8px 0' }}>
-          ✓ Já aplicado em {monthShort(parseMonthKey(mk))}
-        </div>
-      )}
-
-      <button onClick={onClose} style={{ width: '100%', padding: '13px', background: 'transparent', border: 'none', color: C.textSecondary, fontSize: 15, cursor: 'pointer' }}>
-        Cancelar
-      </button>
-    </ActionSheet>
+        <button onClick={finish} style={{
+          width: '100%', padding: '11px', background: 'transparent', border: 'none',
+          color: C.textTertiary, fontSize: 14, cursor: 'pointer',
+        }}>
+          Pular tutorial
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -2279,6 +2764,13 @@ function EnvelopeLinkModal({ category, data, mk, onClose, updateData, showToast 
 // ACTION SHEET (mobile-safe overlay from bottom)
 // =====================================================
 function ActionSheet({ title, onClose, children }) {
+  // Fix 3: travar scroll do fundo quando modal está aberto
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = prev; };
+  }, []);
+
   return (
     <div style={{
       position: 'fixed', inset: 0, zIndex: 300,
@@ -2562,7 +3054,11 @@ function CategoriesEditor({ data, updateData, showToast }) {
                 <input
                   type="text" value={c.name}
                   onChange={(e) => updateCategory(c.id, { name: e.target.value })}
-                  style={{ flex: 1, minWidth: 0, background: 'transparent', border: 'none', color: C.textPrimary, fontSize: 15, fontWeight: 500 }}
+                  style={{
+                    flex: 1, minWidth: 0, background: 'transparent', border: 'none',
+                    color: C.textPrimary, fontSize: 15, fontWeight: 500,
+                    whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                  }}
                 />
                 <button
                   onClick={() => setExpanded(s => ({ ...s, [c.id]: !s[c.id] }))}
@@ -2623,56 +3119,60 @@ function CategoriesEditor({ data, updateData, showToast }) {
       </div>
 
       {/* ActionSheet do ⋯ */}
-      {catSheet && (
-        <ActionSheet title={catSheet.name} onClose={() => setCatSheet(null)}>
-          {/* Tipo */}
-          <div style={{ marginBottom: 12 }}>
-            <div style={{ fontSize: 12, color: C.textTertiary, marginBottom: 6, fontWeight: 600 }}>TIPO</div>
-            <div style={{ display: 'flex', gap: 8 }}>
-              {['expense', 'income', 'both'].map(t => (
-                <button key={t} onClick={() => updateCategory(catSheet.id, { type: t })} style={{
-                  flex: 1, padding: '10px 4px', borderRadius: 10, border: 'none', cursor: 'pointer', fontSize: 13, fontWeight: 600,
-                  background: catSheet.type === t ? C.blue : C.cardElevated,
-                  color: catSheet.type === t ? '#fff' : C.textSecondary,
-                }}>
-                  {t === 'expense' ? 'Saída' : t === 'income' ? 'Entrada' : 'Ambos'}
-                </button>
-              ))}
-            </div>
-          </div>
-          {/* Orçamento */}
-          {(catSheet.type === 'expense' || catSheet.type === 'both') && (
-            <div style={{ marginBottom: 16 }}>
-              <div style={{ fontSize: 12, color: C.textTertiary, marginBottom: 6, fontWeight: 600 }}>ORÇAMENTO</div>
+      {catSheet && (() => {
+        // Fix 1: sempre lê do estado vivo, nunca do snapshot
+        const liveCat = data.categories.find(c => c.id === catSheet.id) || catSheet;
+        return (
+          <ActionSheet title={liveCat.name} onClose={() => setCatSheet(null)}>
+            {/* Tipo */}
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 12, color: C.textTertiary, marginBottom: 6, fontWeight: 600 }}>TIPO</div>
               <div style={{ display: 'flex', gap: 8 }}>
-                {['envelope', 'fixed'].map(bt => (
-                  <button key={bt} onClick={() => updateCategory(catSheet.id, { budgetType: bt })} style={{
+                {['expense', 'income', 'both'].map(t => (
+                  <button key={t} onClick={() => updateCategory(liveCat.id, { type: t })} style={{
                     flex: 1, padding: '10px 4px', borderRadius: 10, border: 'none', cursor: 'pointer', fontSize: 13, fontWeight: 600,
-                    background: (catSheet.budgetType || 'envelope') === bt ? C.blue : C.cardElevated,
-                    color: (catSheet.budgetType || 'envelope') === bt ? '#fff' : C.textSecondary,
+                    background: liveCat.type === t ? C.blue : C.cardElevated,
+                    color: liveCat.type === t ? '#fff' : C.textSecondary,
                   }}>
-                    {bt === 'envelope' ? 'Envelope' : 'Fixa'}
+                    {t === 'expense' ? 'Saída' : t === 'income' ? 'Entrada' : 'Ambos'}
                   </button>
                 ))}
               </div>
             </div>
-          )}
-          <div style={{ height: 0.5, background: C.separator, margin: '4px 0 12px' }} />
-          <button onClick={() => { setConfirmDelete(catSheet.id); setCatSheet(null); }} style={{
-            width: '100%', padding: '15px', background: C.redDim, border: 'none',
-            color: C.red, borderRadius: 12, fontSize: 16, fontWeight: 600, cursor: 'pointer',
-            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
-          }}>
-            <Trash2 size={16} /> Excluir categoria
-          </button>
-          <button onClick={() => setCatSheet(null)} style={{
-            width: '100%', padding: '13px', background: 'transparent', border: 'none',
-            color: C.textSecondary, fontSize: 15, cursor: 'pointer', marginTop: 8,
-          }}>
-            Fechar
-          </button>
-        </ActionSheet>
-      )}
+            {/* Orçamento — só para saída/ambos */}
+            {(liveCat.type === 'expense' || liveCat.type === 'both') && (
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ fontSize: 12, color: C.textTertiary, marginBottom: 6, fontWeight: 600 }}>ORÇAMENTO</div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  {['envelope', 'fixed'].map(bt => (
+                    <button key={bt} onClick={() => updateCategory(liveCat.id, { budgetType: bt })} style={{
+                      flex: 1, padding: '10px 4px', borderRadius: 10, border: 'none', cursor: 'pointer', fontSize: 13, fontWeight: 600,
+                      background: (liveCat.budgetType || 'envelope') === bt ? C.blue : C.cardElevated,
+                      color: (liveCat.budgetType || 'envelope') === bt ? '#fff' : C.textSecondary,
+                    }}>
+                      {bt === 'envelope' ? 'Envelope' : 'Fixa'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            <div style={{ height: 0.5, background: C.separator, margin: '4px 0 12px' }} />
+            <button onClick={() => { setConfirmDelete(liveCat.id); setCatSheet(null); }} style={{
+              width: '100%', padding: '15px', background: C.redDim, border: 'none',
+              color: C.red, borderRadius: 12, fontSize: 16, fontWeight: 600, cursor: 'pointer',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+            }}>
+              <Trash2 size={16} /> Excluir categoria
+            </button>
+            <button onClick={() => setCatSheet(null)} style={{
+              width: '100%', padding: '13px', background: 'transparent', border: 'none',
+              color: C.textSecondary, fontSize: 15, cursor: 'pointer', marginTop: 8,
+            }}>
+              Fechar
+            </button>
+          </ActionSheet>
+        );
+      })()}
 
       {/* Confirmar exclusão */}
       {confirmDelete && (
@@ -2768,6 +3268,13 @@ function RecurrencesEditor({ data, updateData, showToast, openModal }) {
 // MODAL ROOT
 // =====================================================
 function ModalRoot({ modal, close, data, mk, currentMonth, updateData, showToast, openModal }) {
+  // Fix 3: travar scroll do fundo
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = prev; };
+  }, []);
+
   return (
     <div style={{
       position: 'fixed', inset: 0, zIndex: 100, display: 'flex', alignItems: 'flex-end', justifyContent: 'center',
